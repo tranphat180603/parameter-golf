@@ -86,7 +86,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 16384))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     shared_mlp_enabled = bool(int(os.environ.get("SHARED_MLP_ENABLED", "1")))
     shared_encoder_mlp_ids = os.environ.get("SHARED_ENCODER_MLP_IDS", "")
@@ -95,6 +95,7 @@ class Hyperparameters:
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
+    prune_frac = float(os.environ.get("PRUNE_FRAC", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -285,7 +286,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 FP16_KEEP_NAME_PATTERNS = tuple(
     pattern
-    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb,blocks.8.attn.c_k").split(",")
+    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb,blocks.8.attn.c_k,bigram.proj").split(",")
     if pattern
 )
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
@@ -587,7 +588,7 @@ def resolve_mlp_ids(spec: str, depth: int, enable_sharing: bool) -> list[int]:
     elif depth == 6:
         ids = [0, 1, 2, 0, 1, 2]
     elif depth == 5:
-        ids = [0, 1, 2, 3, 0]
+        ids = [0, 1, 2, 0, 1]
     else:
         ids = list(range(depth))
     if any(idx < 0 for idx in ids):
@@ -644,13 +645,12 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward_attn(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, mlp: nn.Module) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        return x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-
-    def forward_mlp(self, x: Tensor, mlp_out: Tensor) -> Tensor:
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_out = mlp(self.mlp_norm(x))
         return x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
 
 
@@ -731,15 +731,13 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             block = self.blocks[i]
-            x = block.forward_attn(x, x0)
-            x = block.forward_mlp(x, self.encoder_mlps[self.encoder_mlp_ids[i]](block.mlp_norm(x)))
+            x = block(x, x0, self.encoder_mlps[self.encoder_mlp_ids[i]])
             skips.append(x)
         for i in range(self.num_decoder_layers):
             block = self.blocks[self.num_encoder_layers + i]
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = block.forward_attn(x, x0)
-            x = block.forward_mlp(x, self.decoder_mlps[self.decoder_mlp_ids[i]](block.mlp_norm(x)))
+            x = block(x, x0, self.decoder_mlps[self.decoder_mlp_ids[i]])
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -761,15 +759,13 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             block = self.blocks[i]
-            x = block.forward_attn(x, x0)
-            x = block.forward_mlp(x, self.encoder_mlps[self.encoder_mlp_ids[i]](block.mlp_norm(x)))
+            x = block(x, x0, self.encoder_mlps[self.encoder_mlp_ids[i]])
             skips.append(x)
         for i in range(self.num_decoder_layers):
             block = self.blocks[self.num_encoder_layers + i]
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = block.forward_attn(x, x0)
-            x = block.forward_mlp(x, self.decoder_mlps[self.decoder_mlp_ids[i]](block.mlp_norm(x)))
+            x = block(x, x0, self.decoder_mlps[self.decoder_mlp_ids[i]])
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1044,6 +1040,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"export:prune_frac:{args.prune_frac} fp16_keep:{','.join(FP16_KEEP_NAME_PATTERNS)}")
     log0(f"seed:{args.seed}")
 
     # DATA LOADER & MODEL WARMUP
@@ -1212,13 +1209,14 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    # Magnitude pruning: zero out smallest weights to improve compression
-    with torch.no_grad():
-        for name, param in base_model.named_parameters():
-            if param.ndim == 2 and param.numel() > 65536:
-                threshold = torch.quantile(param.abs().float().flatten(), 0.03)
-                mask = param.abs() < threshold
-                param.masked_fill_(mask, 0.0)
+    # Optional magnitude pruning: zero out smallest weights to improve compression
+    if args.prune_frac > 0.0:
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                if param.ndim == 2 and param.numel() > 65536:
+                    threshold = torch.quantile(param.abs().float().flatten(), args.prune_frac)
+                    mask = param.abs() < threshold
+                    param.masked_fill_(mask, 0.0)
 
     # INT6 mixed quantization + zstd/zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
