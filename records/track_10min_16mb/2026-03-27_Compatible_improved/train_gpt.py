@@ -670,6 +670,9 @@ class CausalSelfAttention(nn.Module):
         q = q.to(flash_dtype)
         k = k.to(flash_dtype)
         v = v.to(flash_dtype)
+        assert q.dtype in (torch.float16, torch.bfloat16), q.dtype
+        assert k.dtype in (torch.float16, torch.bfloat16), k.dtype
+        assert v.dtype in (torch.float16, torch.bfloat16), v.dtype
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
@@ -878,9 +881,14 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s = self.ln_scale_factor
-        attn_out = self.attn(self.attn_norm(x) * s)
+
+        norm_attn_x = (self.attn_norm(x) * s).to(x.dtype)
+        attn_out = self.attn(norm_attn_x)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s, up_w, down_w)
+
+        norm_mlp_x = (self.mlp_norm(x) * s).to(x.dtype)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(norm_mlp_x, up_w, down_w)
+
         return x
 
 
