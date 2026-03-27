@@ -113,7 +113,6 @@ class Hyperparameters:
     # Hypernetwork MLP parameters
     use_hyper_mlp = bool(int(os.environ.get("USE_HYPER_MLP", "0")))
     hyper_rank = int(os.environ.get("HYPER_RANK", 8))
-    hyper_num_bases = int(os.environ.get("HYPER_NUM_BASES", 8))
     hyper_layer_code_dim = int(os.environ.get("HYPER_LAYER_CODE_DIM", 64))
     hyper_type_embed_dim = int(os.environ.get("HYPER_TYPE_EMBED_DIM", 16))
     hyper_depth_feature_dim = int(os.environ.get("HYPER_DEPTH_FEATURE_DIM", 9))
@@ -729,14 +728,12 @@ class HyperMLPGenerator(nn.Module):
         generator_hidden: int = 128,
         generator_blocks: int = 2,
         rank: int = 8,
-        num_bases: int = 8,
     ):
         super().__init__()
         self.num_layers = num_layers
         self.dim = dim
         self.mlp_hidden = mlp_hidden
         self.rank = rank
-        self.num_bases = num_bases
 
         self.layer_codes = nn.Parameter(torch.zeros(num_layers, layer_code_dim))
         self.type_embeddings = nn.Parameter(torch.zeros(2, type_embed_dim))  # 0=up, 1=down
@@ -754,10 +751,7 @@ class HyperMLPGenerator(nn.Module):
             for _ in range(generator_blocks)
         ])
 
-        # per-operator heads
-        self.up_coeff_head = nn.Linear(generator_hidden, num_bases, bias=False)
-        self.down_coeff_head = nn.Linear(generator_hidden, num_bases, bias=False)
-
+        # per-operator low-rank + alpha heads only
         self.up_u_head = nn.Linear(generator_hidden, mlp_hidden * rank, bias=False)
         self.up_v_head = nn.Linear(generator_hidden, dim * rank, bias=False)
         self.down_u_head = nn.Linear(generator_hidden, dim * rank, bias=False)
@@ -776,8 +770,6 @@ class HyperMLPGenerator(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=1.0)
 
-        nn.init.zeros_(self.up_coeff_head.weight)
-        nn.init.zeros_(self.down_coeff_head.weight)
         nn.init.zeros_(self.up_u_head.weight)
         nn.init.zeros_(self.up_v_head.weight)
         nn.init.zeros_(self.down_u_head.weight)
@@ -797,7 +789,6 @@ class HyperMLPGenerator(nn.Module):
         op_idx: int,
         depth_feat: Tensor,
         shared_w: Tensor,
-        bases: Tensor,
     ) -> Tensor:
         # op_idx: 0=up, 1=down
         z = self.layer_codes[layer_idx]
@@ -805,23 +796,17 @@ class HyperMLPGenerator(nn.Module):
         inp = torch.cat([z, depth_feat, t], dim=0)
         h = self._trunk(inp)
 
-        if op_idx == 0:
-            coeff = self.up_coeff_head(h)
+        if op_idx == 0:  # up
             U = self.up_u_head(h).view(self.mlp_hidden, self.rank)
             V = self.up_v_head(h).view(self.dim, self.rank)
             alpha = 0.1 * torch.tanh(self.up_alpha_head(h).squeeze(-1))
-        else:
-            coeff = self.down_coeff_head(h)
+        else:  # down
             U = self.down_u_head(h).view(self.dim, self.rank)
             V = self.down_v_head(h).view(self.mlp_hidden, self.rank)
             alpha = 0.1 * torch.tanh(self.down_alpha_head(h).squeeze(-1))
 
-        # mild coefficient squashing
-        coeff = 0.05 * torch.tanh(coeff)
-
-        basis_term = torch.einsum("k,koi->oi", coeff, bases)
         low_rank_term = U @ V.T
-        return shared_w + alpha * (basis_term + low_rank_term)
+        return shared_w + alpha * low_rank_term
 
 
 class MLP(nn.Module):
@@ -915,7 +900,6 @@ class GPT(nn.Module):
         ln_scale: bool = False,
         use_hyper_mlp: bool = False,
         hyper_rank: int = 8,
-        hyper_num_bases: int = 8,
         hyper_layer_code_dim: int = 64,
         hyper_type_embed_dim: int = 16,
         hyper_depth_feature_dim: int = 9,
@@ -977,12 +961,9 @@ class GPT(nn.Module):
         if use_hyper_mlp:
             h = self.mlp_hidden
             d = model_dim
-            K = hyper_num_bases
 
             self.mlp_up_shared = nn.Parameter(torch.empty(h, d))
             self.mlp_down_shared = nn.Parameter(torch.empty(d, h))
-            self.mlp_up_bases = nn.Parameter(torch.empty(K, h, d))
-            self.mlp_down_bases = nn.Parameter(torch.empty(K, d, h))
 
             depth_feats = self._build_depth_features(num_layers, hyper_depth_feature_dim)
             self.register_buffer("hyper_depth_features", depth_feats, persistent=True)
@@ -997,13 +978,10 @@ class GPT(nn.Module):
                 generator_hidden=hyper_generator_hidden,
                 generator_blocks=hyper_generator_blocks,
                 rank=hyper_rank,
-                num_bases=hyper_num_bases,
             )
         else:
             self.mlp_up_shared = None
             self.mlp_down_shared = None
-            self.mlp_up_bases = None
-            self.mlp_down_bases = None
             self.hyper_mlp_generator = None
             self.hyper_depth_features = None
 
@@ -1034,14 +1012,12 @@ class GPT(nn.Module):
                 op_idx=0,
                 depth_feat=depth_feat,
                 shared_w=self.mlp_up_shared,
-                bases=self.mlp_up_bases,
             )
             down_w = self.hyper_mlp_generator.realize_one_weight(
                 layer_idx=layer_idx,
                 op_idx=1,
                 depth_feat=depth_feat,
                 shared_w=self.mlp_down_shared,
-                bases=self.mlp_down_bases,
             )
             up_weights.append(up_w)
             down_weights.append(down_w)
@@ -1066,10 +1042,6 @@ class GPT(nn.Module):
         if self.use_hyper_mlp:
             nn.init.orthogonal_(self.mlp_up_shared, gain=1.0)
             nn.init.zeros_(self.mlp_down_shared)
-
-            for k in range(self.mlp_up_bases.shape[0]):
-                nn.init.orthogonal_(self.mlp_up_bases[k], gain=0.02)
-                nn.init.orthogonal_(self.mlp_down_bases[k], gain=0.02)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1262,14 +1234,11 @@ def _classify_param(name: str) -> str:
             "layer_codes",
             "type_embeddings",
             "alpha_head",
-            "coeff_head",
         ]):
             return "other"
         return "mlp"
 
     if "mlp_up_shared" in name or "mlp_down_shared" in name:
-        return "mlp"
-    if "mlp_up_bases" in name or "mlp_down_bases" in name:
         return "mlp"
 
     if ".mlp." in name:
@@ -1470,7 +1439,6 @@ def main() -> None:
         ln_scale=args.ln_scale,
         use_hyper_mlp=args.use_hyper_mlp,
         hyper_rank=args.hyper_rank,
-        hyper_num_bases=args.hyper_num_bases,
         hyper_layer_code_dim=args.hyper_layer_code_dim,
         hyper_type_embed_dim=args.hyper_type_embed_dim,
         hyper_depth_feature_dim=args.hyper_depth_feature_dim,
@@ -1515,7 +1483,6 @@ def main() -> None:
         "layer_codes",
         "type_embeddings",
         "alpha_head",
-        "coeff_head",
     )
 
     for name, p in all_named_params:
@@ -1526,11 +1493,6 @@ def main() -> None:
 
         # tiny hyper control tensors -> AdamW
         if "hyper_mlp_generator" in name and any(k in name for k in hyper_scalar_keywords):
-            add_param(scalar_params, p)
-            continue
-
-        # 3D basis tensors must NOT go to Muon
-        if name in {"mlp_up_bases", "mlp_down_bases"}:
             add_param(scalar_params, p)
             continue
 
@@ -1604,12 +1566,11 @@ def main() -> None:
     # Log hypernetwork MLP configuration if enabled
     if base_model.use_hyper_mlp:
         shared_params = base_model.mlp_up_shared.numel() + base_model.mlp_down_shared.numel()
-        bases_params = base_model.mlp_up_bases.numel() + base_model.mlp_down_bases.numel()
         generator_params = sum(p.numel() for p in base_model.hyper_mlp_generator.parameters())
         log0(
-            f"hyper_mlp:enabled rank:{args.hyper_rank} num_bases:{args.hyper_num_bases} "
+            f"hyper_mlp:enabled rank:{args.hyper_rank} "
             f"generator_hidden:{args.hyper_generator_hidden} "
-            f"shared_params:{shared_params} bases_params:{bases_params} generator_params:{generator_params}"
+            f"shared_params:{shared_params} generator_params:{generator_params}"
         )
     else:
         log0("hyper_mlp:disabled")
@@ -1859,7 +1820,6 @@ def main() -> None:
         ln_scale=args.ln_scale,
         use_hyper_mlp=args.use_hyper_mlp,
         hyper_rank=args.hyper_rank,
-        hyper_num_bases=args.hyper_num_bases,
         hyper_layer_code_dim=args.hyper_layer_code_dim,
         hyper_type_embed_dim=args.hyper_type_embed_dim,
         hyper_depth_feature_dim=args.hyper_depth_feature_dim,
