@@ -666,9 +666,10 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        q = q.to(torch.bfloat16)
-        k = k.to(torch.bfloat16)
-        v = v.to(torch.bfloat16)
+        flash_dtype = x.dtype
+        q = q.to(flash_dtype)
+        k = k.to(flash_dtype)
+        v = v.to(flash_dtype)
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
@@ -1472,7 +1473,11 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if args.use_hyper_mlp:
+        log0("hyper_mlp: disabling train-time torch.compile")
+        compiled_model = base_model
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1511,15 +1516,26 @@ def main() -> None:
         if name == "lm_head.weight":
             continue
 
+        # tiny hyper control tensors -> AdamW
         if "hyper_mlp_generator" in name and any(k in name for k in hyper_scalar_keywords):
             add_param(scalar_params, p)
             continue
 
+        # 3D basis tensors must NOT go to Muon
+        if name in {"mlp_up_bases", "mlp_down_bases"}:
+            add_param(scalar_params, p)
+            continue
+
+        # all vectors / scalars / control tensors -> AdamW
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
             add_param(scalar_params, p)
             continue
 
-        add_param(matrix_params, p)
+        # Muon only for true 2D matrices
+        if p.ndim == 2:
+            add_param(matrix_params, p)
+        else:
+            add_param(scalar_params, p)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
