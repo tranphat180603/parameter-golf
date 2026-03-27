@@ -1075,8 +1075,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
+        x = F.rms_norm(x, (x.size(-1),)).to(torch.bfloat16)
+        x = self.smear(x).to(torch.bfloat16)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1135,8 +1135,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
+        x = F.rms_norm(x, (x.size(-1),)).to(torch.bfloat16)
+        x = self.smear(x).to(torch.bfloat16)
         x0 = x
         skips: list[Tensor] = []
 
