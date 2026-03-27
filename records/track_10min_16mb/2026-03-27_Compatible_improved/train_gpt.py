@@ -1021,7 +1021,7 @@ class GPT(nn.Module):
                 shared_w=self.mlp_up_shared,
                 bases=self.mlp_up_bases,
             )
-            down_w = self.hyper_mlp_generator._generate_one(
+            down_w = self.hyper_mlp_generator.realize_one_weight(
                 layer_idx=layer_idx,
                 op_idx=1,
                 depth_feat=depth_feat,
