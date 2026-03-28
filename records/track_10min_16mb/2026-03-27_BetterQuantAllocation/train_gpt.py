@@ -98,13 +98,18 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
-    quant_keep_late_layers_int8 = int(os.environ.get("QUANT_KEEP_LATE_LAYERS_INT8", 2))
+    quant_keep_late_layers_int8 = int(os.environ.get("QUANT_KEEP_LATE_LAYERS_INT8", 0))
     quant_force_fp16_patterns = os.environ.get("QUANT_FORCE_FP16_PATTERNS", "")
     quant_force_int8_patterns = os.environ.get("QUANT_FORCE_INT8_PATTERNS", "")
     quant_force_int6_patterns = os.environ.get("QUANT_FORCE_INT6_PATTERNS", "")
     quant_sensitivity_enabled = bool(int(os.environ.get("QUANT_SENSITIVITY_ENABLED", "0")))
     quant_sensitivity_tokens = int(os.environ.get("QUANT_SENSITIVITY_TOKENS", 1_048_576))
     quant_sensitivity_max_groups = int(os.environ.get("QUANT_SENSITIVITY_MAX_GROUPS", 12))
+    quant_mlp_equalize_enabled = bool(int(os.environ.get("QUANT_MLP_EQUALIZE_ENABLED", "1")))
+    quant_mlp_equalize_alpha = float(os.environ.get("QUANT_MLP_EQUALIZE_ALPHA", 0.5))
+    quant_mlp_equalize_metric = os.environ.get("QUANT_MLP_EQUALIZE_METRIC", "rms")
+    quant_mlp_equalize_min_scale = float(os.environ.get("QUANT_MLP_EQUALIZE_MIN_SCALE", 0.25))
+    quant_mlp_equalize_max_scale = float(os.environ.get("QUANT_MLP_EQUALIZE_MAX_SCALE", 4.0))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1361,6 +1366,89 @@ def _serialize_quant_payload(result: dict[str, Tensor], meta: dict[str, object])
     quant_raw = quant_buf.getvalue()
     return lzma.compress(quant_raw, preset=6), len(quant_raw)
 
+
+def _channel_stat(t: Tensor, *, dim: int, metric: str) -> Tensor:
+    tf = t.float()
+    if metric == "max":
+        return tf.abs().amax(dim=dim)
+    if metric == "rms":
+        return tf.square().mean(dim=dim).sqrt()
+    raise ValueError(f"Unsupported QUANT_MLP_EQUALIZE_METRIC={metric}")
+
+
+def apply_exact_mlp_equalization(
+    state_dict: dict[str, Tensor],
+    *,
+    enabled: bool,
+    alpha: float,
+    metric: str,
+    min_scale: float,
+    max_scale: float,
+    eps: float = 1e-8,
+) -> tuple[dict[str, Tensor], dict[str, float | int | str]]:
+    if not enabled or alpha <= 0.0:
+        return state_dict, {
+            "enabled": int(enabled),
+            "alpha": alpha,
+            "metric": metric,
+            "layers": 0,
+            "channels": 0,
+            "scale_min": 1.0,
+            "scale_max": 1.0,
+            "scale_mean": 1.0,
+        }
+
+    out = dict(state_dict)
+    scale_stats: list[Tensor] = []
+    num_layers_total = max(
+        (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
+        default=0,
+    ) + 1
+    exp = alpha / 3.0
+
+    for layer_idx in range(num_layers_total):
+        up_name = f"blocks.{layer_idx}.mlp.fc.weight"
+        down_name = f"blocks.{layer_idx}.mlp.proj.weight"
+        if up_name not in out or down_name not in out:
+            continue
+        up = out[up_name].detach().cpu().contiguous()
+        down = out[down_name].detach().cpu().contiguous()
+        if up.ndim != 2 or down.ndim != 2 or up.shape[0] != down.shape[1]:
+            continue
+
+        up_stat = _channel_stat(up, dim=1, metric=metric)
+        down_stat = _channel_stat(down, dim=0, metric=metric)
+        scales = ((down_stat + eps) / (up_stat + eps)).pow(exp).clamp(min_scale, max_scale)
+        scale_sq = scales.square()
+
+        out[up_name] = (up.float() * scales[:, None]).to(up.dtype)
+        out[down_name] = (down.float() / scale_sq[None, :]).to(down.dtype)
+        scale_stats.append(scales)
+
+    if not scale_stats:
+        return out, {
+            "enabled": int(enabled),
+            "alpha": alpha,
+            "metric": metric,
+            "layers": 0,
+            "channels": 0,
+            "scale_min": 1.0,
+            "scale_max": 1.0,
+            "scale_mean": 1.0,
+        }
+
+    all_scales = torch.cat(scale_stats)
+    return out, {
+        "enabled": 1,
+        "alpha": alpha,
+        "metric": metric,
+        "layers": len(scale_stats),
+        "channels": int(all_scales.numel()),
+        "scale_min": float(all_scales.min().item()),
+        "scale_max": float(all_scales.max().item()),
+        "scale_mean": float(all_scales.mean().item()),
+    }
+
 def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
     """Convert 3D bank tensors into individual 2D tensors with standard names."""
     out: dict[str, Tensor] = {}
@@ -2113,6 +2201,23 @@ def main() -> None:
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    unbanked_sd, mlp_eq_stats = apply_exact_mlp_equalization(
+        unbanked_sd,
+        enabled=args.quant_mlp_equalize_enabled,
+        alpha=args.quant_mlp_equalize_alpha,
+        metric=args.quant_mlp_equalize_metric,
+        min_scale=args.quant_mlp_equalize_min_scale,
+        max_scale=args.quant_mlp_equalize_max_scale,
+    )
+    log0(
+        f"quant_mlp_equalize enabled={int(args.quant_mlp_equalize_enabled)} "
+        f"alpha={args.quant_mlp_equalize_alpha:.3f} metric={args.quant_mlp_equalize_metric} "
+        f"clamp=[{args.quant_mlp_equalize_min_scale:.2f},{args.quant_mlp_equalize_max_scale:.2f}] "
+        f"layers={int(mlp_eq_stats['layers'])} channels={int(mlp_eq_stats['channels'])} "
+        f"scale_min={float(mlp_eq_stats['scale_min']):.3f} "
+        f"scale_max={float(mlp_eq_stats['scale_max']):.3f} "
+        f"scale_mean={float(mlp_eq_stats['scale_mean']):.3f}"
+    )
     log0(
         f"quant_export: late_layers_int8={args.quant_keep_late_layers_int8} "
         f"force_fp16={','.join(force_fp16_patterns) or '-'} "
