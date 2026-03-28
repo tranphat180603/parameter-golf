@@ -10,14 +10,16 @@ Goal:
 - keep the first pass export-only so training dynamics stay comparable to the March 23 baseline
 - add exact MLP hidden-channel equalization before quantization, exploiting the winner's `LeakyReLU(x)^2` MLP so float behavior is preserved
 
-Planned first changes:
+What This Branch Established:
 
-- add per-name precision overrides for `fp16`, `int8`, and `int6`
-- add a small sensitivity profiler using held-out validation slices
-- rank tensors by `delta_bpb / byte_saved` instead of only using broad category rules
-- reparameterize `mlp.fc` / `mlp.proj` pairs before export to flatten fragile MLP channels without changing float outputs
+- The built-in `late_layers_int8` heuristic was not worth it. It pushed the artifact over cap without improving final bpb.
+- The sensitivity profiler was useful: fragile groups were mostly MLPs, not the late-layer heuristic targets.
+- The next natural extension is bank-aware late QAT, because the profiler's fragile tensors are bank-derived MLP slices while the winner's existing late QAT only touches `CastedLinear` weights.
+- This branch became the base for the later dated export experiments:
+  - `2026-03-28_MLPEqualizedExport`
+  - `2026-03-28_PermutationAwareExport`
 
-Current knobs:
+Main knobs:
 
 - `QUANT_KEEP_LATE_LAYERS_INT8=0`
 - `QUANT_FORCE_FP16_PATTERNS=...`
@@ -31,8 +33,39 @@ Current knobs:
 - `QUANT_SENSITIVITY_ENABLED=1`
 - `QUANT_SENSITIVITY_TOKENS=1048576`
 - `QUANT_SENSITIVITY_MAX_GROUPS=12`
+- `BANK_QAT_ENABLED=1`
+- `BANK_QAT_BLOCKS=0,1,2,3`
+- `BANK_QAT_INCLUDE_MLP=1`
+- `BANK_QAT_INCLUDE_ATTN=0`
+- `BANK_QAT_THRESHOLD=-1`
 
-Suggested full validation run from repo root:
+Suggested profiler run from repo root:
+
+```bash
+NUM_LAYERS=11 BIGRAM_VOCAB_SIZE=1536 XSA_LAST_N=4 \
+EMA_ENABLED=1 EMA_DECAY=0.997 SWA_ENABLED=1 SWA_EVERY=50 \
+ROPE_DIMS=16 LN_SCALE=1 LATE_QAT=1 LATE_QAT_THRESHOLD=0.15 \
+VE_ENABLED=1 VE_DIM=128 VE_LAYERS=9,10 \
+MUON_WD=0.04 ADAM_WD=0.04 \
+MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035 \
+MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92 \
+MUON_MOMENTUM_WARMUP_STEPS=1500 WARMDOWN_ITERS=3500 \
+ITERATIONS=9000 MAX_WALLCLOCK_SECONDS=600 EVAL_STRIDE=64 \
+QUANT_KEEP_LATE_LAYERS_INT8=0 \
+QUANT_MLP_EQUALIZE_ENABLED=1 QUANT_MLP_EQUALIZE_ALPHA=0.5 \
+QUANT_MLP_EQUALIZE_METRIC=rms QUANT_MLP_EQUALIZE_MIN_SCALE=0.25 QUANT_MLP_EQUALIZE_MAX_SCALE=4.0 \
+QUANT_SENSITIVITY_ENABLED=1 QUANT_SENSITIVITY_TOKENS=1048576 QUANT_SENSITIVITY_MAX_GROUPS=8 \
+SEED=1337 \
+torchrun --standalone --nproc_per_node=8 \
+records/track_10min_16mb/2026-03-27_BetterQuantAllocation/train_gpt.py
+```
+
+Status:
+
+- Useful as a profiler / staging branch.
+- The newest thing to try from this folder is bank-aware late QAT on top of export equalization.
+
+Suggested bank-aware late-QAT run from repo root:
 
 ```bash
 NUM_LAYERS=11 BIGRAM_VOCAB_SIZE=1536 XSA_LAST_N=4 \
@@ -49,6 +82,8 @@ ITERATIONS=9000 MAX_WALLCLOCK_SECONDS=600 EVAL_STRIDE=64 \
 QUANT_KEEP_LATE_LAYERS_INT8=0 \
 QUANT_MLP_EQUALIZE_ENABLED=1 QUANT_MLP_EQUALIZE_ALPHA=0.5 \
 QUANT_MLP_EQUALIZE_METRIC=rms QUANT_MLP_EQUALIZE_MIN_SCALE=0.25 QUANT_MLP_EQUALIZE_MAX_SCALE=4.0 \
+BANK_QAT_ENABLED=1 BANK_QAT_BLOCKS=0,1,2,3 BANK_QAT_INCLUDE_MLP=1 BANK_QAT_INCLUDE_ATTN=0 \
+QUANT_SENSITIVITY_ENABLED=0 \
 SEED=1337 \
 torchrun --standalone --nproc_per_node=8 \
 records/track_10min_16mb/2026-03-27_BetterQuantAllocation/train_gpt.py

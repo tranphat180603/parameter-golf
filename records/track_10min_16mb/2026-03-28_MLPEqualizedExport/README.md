@@ -9,7 +9,22 @@ Base:
 
 - `records/track_10min_16mb/2026-03-27_BetterQuantAllocation/train_gpt.py`
 
-Current knobs:
+Observed Result:
+
+- Essentially a tie with the March 23 baseline, but very slightly worse on final score.
+- `legal_ttt_exact`: `1.11932544`
+- March 23 reference: `1.11922988`
+- Artifact was slightly smaller than March 23:
+  - this branch: `15923586` total bytes
+  - March 23: `15952368` total bytes
+
+Conclusion:
+
+- Exact MLP equalization slightly improved compressibility.
+- It did not produce a real bpb win by itself.
+- This branch is kept as the clean control for export-side exact rescaling.
+
+Main knobs:
 
 - `QUANT_KEEP_LATE_LAYERS_INT8=0`
 - `QUANT_FORCE_FP16_PATTERNS=...`
@@ -20,11 +35,9 @@ Current knobs:
 - `QUANT_MLP_EQUALIZE_METRIC=rms`
 - `QUANT_MLP_EQUALIZE_MIN_SCALE=0.25`
 - `QUANT_MLP_EQUALIZE_MAX_SCALE=4.0`
-- `QUANT_SENSITIVITY_ENABLED=1`
-- `QUANT_SENSITIVITY_TOKENS=1048576`
-- `QUANT_SENSITIVITY_MAX_GROUPS=12`
+- `QUANT_SENSITIVITY_ENABLED=0` for the final paid comparison run
 
-Suggested full validation run from repo root:
+Validated run from repo root:
 
 ```bash
 NUM_LAYERS=11 BIGRAM_VOCAB_SIZE=1536 XSA_LAST_N=4 \
@@ -45,3 +58,8 @@ SEED=1337 \
 torchrun --standalone --nproc_per_node=8 \
 records/track_10min_16mb/2026-03-28_MLPEqualizedExport/train_gpt.py
 ```
+
+Notes:
+
+- This is the cleanest control for exact export-only MLP rescaling.
+- It is safe to keep around as a reference, but it did not beat the March 23 winner.

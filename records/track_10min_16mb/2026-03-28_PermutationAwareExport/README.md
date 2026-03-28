@@ -5,15 +5,23 @@ Goal:
 - keep the current MLP equalization exporter
 - add exact MLP hidden-channel permutations after equalization to improve compressibility with zero functional change
 
-Planned first changes:
+Observed Result:
 
-- add per-name precision overrides for `fp16`, `int8`, and `int6`
-- add a small sensitivity profiler using held-out validation slices
-- rank tensors by `delta_bpb / byte_saved` instead of only using broad category rules
-- reparameterize `mlp.fc` / `mlp.proj` pairs before export to flatten fragile MLP channels without changing float outputs
-- reorder MLP hidden channels consistently across `fc` / `proj` so similar channels sit together in the serialized artifact
+- Negative result.
+- Per-layer permutation search increased the compressed model size instead of reducing it.
+- Example run:
+  - `Serialized model int6+lzma: 16012396`
+  - `Total submission size int6+lzma: 16131670`
+  - `final_int6_roundtrip_exact val_bpb: 1.14418017`
+  - calibration base was already over the byte budget, so auto-allocation had no slack to spend:
+    - `quant_auto_allocate:done no byte budget slack`
 
-Current knobs:
+Conclusion:
+
+- The local per-layer permutation heuristic destroyed enough global regularity that `lzma` compressed worse.
+- This branch was abandoned after the export-stage result was already worse than the equalization control.
+
+Implemented export stack:
 
 - `QUANT_KEEP_LATE_LAYERS_INT8=0`
 - `QUANT_FORCE_FP16_PATTERNS=...`
@@ -31,11 +39,9 @@ Current knobs:
 - `QUANT_AUTO_ALLOCATE_TOKENS=262144`
 - `QUANT_AUTO_ALLOCATE_MAX_GROUPS=8`
 - `QUANT_TARGET_TOTAL_BYTES=16000000`
-- `QUANT_SENSITIVITY_ENABLED=1`
-- `QUANT_SENSITIVITY_TOKENS=1048576`
-- `QUANT_SENSITIVITY_MAX_GROUPS=12`
+- `QUANT_SENSITIVITY_ENABLED=0` for the paid run; auto-allocation handled the calibration pass instead
 
-Suggested full validation run from repo root:
+Run that produced the negative result:
 
 ```bash
 NUM_LAYERS=11 BIGRAM_VOCAB_SIZE=1536 XSA_LAST_N=4 \
@@ -59,3 +65,8 @@ SEED=1337 \
 torchrun --standalone --nproc_per_node=8 \
 records/track_10min_16mb/2026-03-28_PermutationAwareExport/train_gpt.py
 ```
+
+Status:
+
+- Kept as a documented negative result.
+- Not recommended for further paid runs in its current form.

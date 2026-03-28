@@ -90,6 +90,11 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    bank_qat_enabled = bool(int(os.environ.get("BANK_QAT_ENABLED", "0")))
+    bank_qat_threshold = float(os.environ.get("BANK_QAT_THRESHOLD", -1.0))
+    bank_qat_blocks = os.environ.get("BANK_QAT_BLOCKS", "0,1,2,3")
+    bank_qat_include_mlp = bool(int(os.environ.get("BANK_QAT_INCLUDE_MLP", "1")))
+    bank_qat_include_attn = bool(int(os.environ.get("BANK_QAT_INCLUDE_ATTN", "0")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -133,6 +138,16 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) ->
     if was_2d:
         X = X.squeeze(0)
     return X
+
+
+def _parse_int_csv(value: str) -> tuple[int, ...]:
+    out: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(int(part))
+    return tuple(out)
 
 # --- Parallel Muon optimizer ---
 
@@ -563,6 +578,23 @@ class CastedLinear(nn.Linear):
             w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
+
+
+class BankQAT:
+    _enabled: bool = False
+
+
+def fake_quantize_bank_weight_int6(t: Tensor) -> Tensor:
+    if t.ndim != 2:
+        return t
+    t32 = t.float()
+    row_max = t32.abs().amax(dim=1)
+    scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+    q = torch.clamp(torch.round(t32 / scale[:, None]), -31, 31)
+    recon = (q * scale[:, None]).to(dtype=t.dtype)
+    return t + (recon - t).detach()
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
@@ -883,7 +915,31 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        self.bank_qat_layers = tuple(False for _ in range(num_layers))
+        self.bank_qat_include_mlp = True
+        self.bank_qat_include_attn = False
         self._init_weights()
+    def _maybe_bank_qat_block_weights(
+        self,
+        layer_idx: int,
+        q_w: Tensor,
+        k_w: Tensor,
+        v_w: Tensor,
+        out_w: Tensor,
+        up_w: Tensor,
+        down_w: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        if not (self.training and BankQAT._enabled and self.bank_qat_layers[layer_idx]):
+            return q_w, k_w, v_w, out_w, up_w, down_w
+        if self.bank_qat_include_attn:
+            q_w = fake_quantize_bank_weight_int6(q_w)
+            k_w = fake_quantize_bank_weight_int6(k_w)
+            v_w = fake_quantize_bank_weight_int6(v_w)
+            out_w = fake_quantize_bank_weight_int6(out_w)
+        if self.bank_qat_include_mlp:
+            up_w = fake_quantize_bank_weight_int6(up_w)
+            down_w = fake_quantize_bank_weight_int6(down_w)
+        return q_w, k_w, v_w, out_w, up_w, down_w
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -928,10 +984,14 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
+            q_w, k_w, v_w, out_w, up_w, down_w = self._maybe_bank_qat_block_weights(
+                i,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+            )
+            ve = self._get_ve(i, input_ids, ve_cache)
+            x, raw_v = self.blocks[i](x, x0,
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -940,10 +1000,14 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
+            q_w, k_w, v_w, out_w, up_w, down_w = self._maybe_bank_qat_block_weights(
+                bi,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+            )
+            ve = self._get_ve(bi, input_ids, ve_cache)
+            x, _ = self.blocks[bi](x, x0,
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -986,10 +1050,14 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
+            q_w, k_w, v_w, out_w, up_w, down_w = self._maybe_bank_qat_block_weights(
+                i,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+            )
+            ve = self._get_ve(i, input_ids, ve_cache)
+            x, raw_v = self.blocks[i](x, x0,
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -998,10 +1066,14 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
+            q_w, k_w, v_w, out_w, up_w, down_w = self._maybe_bank_qat_block_weights(
+                bi,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+            )
+            ve = self._get_ve(bi, input_ids, ve_cache)
+            x, _ = self.blocks[bi](x, x0,
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1864,6 +1936,7 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     CastedLinear._qat_enabled = args.qat_enabled
+    BankQAT._enabled = False
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1899,6 +1972,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    bank_qat_blocks = {idx for idx in _parse_int_csv(args.bank_qat_blocks) if 0 <= idx < args.num_layers}
+    base_model.bank_qat_layers = tuple(i in bank_qat_blocks for i in range(args.num_layers))
+    base_model.bank_qat_include_mlp = args.bank_qat_include_mlp
+    base_model.bank_qat_include_attn = args.bank_qat_include_attn
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1991,6 +2068,12 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    bank_qat_threshold = args.bank_qat_threshold if args.bank_qat_threshold > 0 else args.late_qat_threshold
+    log0(
+        f"bank_qat enabled={args.bank_qat_enabled} threshold={bank_qat_threshold:.4f} "
+        f"blocks={sorted(bank_qat_blocks)} include_mlp={args.bank_qat_include_mlp} "
+        f"include_attn={args.bank_qat_include_attn}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -2086,6 +2169,13 @@ def main() -> None:
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+        if args.bank_qat_enabled and bank_qat_blocks and scale < bank_qat_threshold and not BankQAT._enabled:
+            BankQAT._enabled = True
+            log0(
+                f"late_bank_qat:enabled step:{step} scale:{scale:.4f} "
+                f"blocks={sorted(bank_qat_blocks)} include_mlp={args.bank_qat_include_mlp} "
+                f"include_attn={args.bank_qat_include_attn}"
+            )
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):

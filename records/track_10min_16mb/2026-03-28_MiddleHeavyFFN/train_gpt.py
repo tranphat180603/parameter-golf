@@ -10,7 +10,13 @@ import subprocess
 import sys
 import time
 import uuid
+import zlib
 from pathlib import Path
+try:
+    import zstandard
+    _COMPRESSOR = "zstd"
+except ImportError:
+    _COMPRESSOR = "zlib"
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -43,6 +49,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    mlp_mults = os.environ.get("MLP_MULTS", "2.75,2.75,3.0,3.0,3.25,3.5,3.25,3.0,3.0,2.75,2.75")
+    mlp_dim_align = int(os.environ.get("MLP_DIM_ALIGN", 128))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -92,11 +100,6 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
-    ttt_mode = os.environ.get("TTT_MODE", "doc_isolated")
-    ttt_bos_id = int(os.environ.get("TTT_BOS_ID", "-1"))
-    ttt_doc_chunk_tokens = int(os.environ.get("TTT_DOC_CHUNK_TOKENS", 256))
-    ttt_doc_eval_seq_len = int(os.environ.get("TTT_DOC_EVAL_SEQ_LEN", 2048))
-    ttt_doc_batch_seqs = int(os.environ.get("TTT_DOC_BATCH_SEQS", 32))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -120,6 +123,47 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) ->
     if was_2d:
         X = X.squeeze(0)
     return X
+
+
+def parse_mlp_mults(spec: str, num_layers: int, default_mult: float) -> tuple[float, ...]:
+    if not spec.strip():
+        return tuple(default_mult for _ in range(num_layers))
+    values = [float(part.strip()) for part in spec.split(",") if part.strip()]
+    if len(values) == 1:
+        return tuple(values[0] for _ in range(num_layers))
+    if len(values) != num_layers:
+        raise ValueError(f"MLP_MULTS must have 1 or {num_layers} values, got {len(values)}")
+    return tuple(values)
+
+
+def mlp_dims_from_mults(model_dim: int, mlp_mults: tuple[float, ...], align: int) -> tuple[int, ...]:
+    dims = []
+    for mult in mlp_mults:
+        raw = max(1, int(round(mult * model_dim)))
+        if align > 1:
+            raw = max(align, int(round(raw / align)) * align)
+        dims.append(raw)
+    return tuple(dims)
+
+
+def build_mlp_groups(mlp_dims: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    group_dims: list[int] = []
+    dim_to_group: dict[int, int] = {}
+    group_counts: list[int] = []
+    group_ids: list[int] = []
+    group_rows: list[int] = []
+    for dim in mlp_dims:
+        gid = dim_to_group.get(dim)
+        if gid is None:
+            gid = len(group_dims)
+            dim_to_group[dim] = gid
+            group_dims.append(dim)
+            group_counts.append(0)
+        row = group_counts[gid]
+        group_counts[gid] += 1
+        group_ids.append(gid)
+        group_rows.append(row)
+    return tuple(group_dims), tuple(group_ids), tuple(group_rows), tuple(group_counts)
 
 # --- Parallel Muon optimizer ---
 
@@ -779,6 +823,8 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_mults: str,
+        mlp_dim_align: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -818,12 +864,20 @@ class GPT(nn.Module):
         # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
-        mlp_dim = int(mlp_mult * model_dim)
+        self.mlp_mults = parse_mlp_mults(mlp_mults, num_layers, float(mlp_mult))
+        self.mlp_dim_align = mlp_dim_align
+        self.mlp_dims = mlp_dims_from_mults(model_dim, self.mlp_mults, mlp_dim_align)
+        self.mlp_group_dims, self.mlp_group_ids, self.mlp_group_rows, self.mlp_group_counts = build_mlp_groups(self.mlp_dims)
+        self.max_mlp_dim = max(self.mlp_dims)
         self.num_layers = num_layers
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
-        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.mlp_up_banks = nn.ParameterList(
+            [nn.Parameter(torch.empty(count, dim, model_dim)) for dim, count in zip(self.mlp_group_dims, self.mlp_group_counts)]
+        )
+        self.mlp_down_banks = nn.ParameterList(
+            [nn.Parameter(torch.empty(count, model_dim, dim)) for dim, count in zip(self.mlp_group_dims, self.mlp_group_counts)]
+        )
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -882,11 +936,13 @@ class GPT(nn.Module):
             nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
             nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
-            nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
-            self.mlp_down_bank.data[i].mul_(proj_scale)
+        for gid in range(len(self.mlp_group_dims)):
+            for row in range(self.mlp_group_counts[gid]):
+                nn.init.orthogonal_(self.mlp_up_banks[gid].data[row], gain=1.0)
+            nn.init.zeros_(self.mlp_down_banks[gid].data)
+            self.mlp_down_banks[gid].data.mul_(proj_scale)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -894,6 +950,10 @@ class GPT(nn.Module):
                     nn.init.zeros_(module.weight)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
+    def _get_mlp_weights(self, layer_idx: int) -> tuple[Tensor, Tensor]:
+        gid = self.mlp_group_ids[layer_idx]
+        row = self.mlp_group_rows[layer_idx]
+        return self.mlp_up_banks[gid][row], self.mlp_down_banks[gid][row]
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -915,10 +975,11 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            up_w, down_w = self._get_mlp_weights(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[n + i], up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -927,10 +988,11 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            up_w, down_w = self._get_mlp_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[n + bi], up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -973,10 +1035,11 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            up_w, down_w = self._get_mlp_weights(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[n + i], up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -985,10 +1048,11 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            up_w, down_w = self._get_mlp_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[n + bi], up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1068,179 +1132,6 @@ def eval_val_sliding(
     tokens_per_byte = token_count.item() / byte_count.item()
     base_model.train()
     return val_loss, bits_per_token * tokens_per_byte
-
-
-def _find_docs_by_bos(tokens: Tensor, bos_id: int, include_next_bos: bool = True) -> list[tuple[int, int]]:
-    if tokens.ndim != 1:
-        raise ValueError(f"Expected 1D token stream, got shape={tuple(tokens.shape)}")
-    bos_positions = (tokens == bos_id).nonzero(as_tuple=True)[0].cpu().numpy().tolist()
-    if not bos_positions:
-        return [(0, int(tokens.numel()))] if tokens.numel() >= 2 else []
-    if bos_positions[0] != 0:
-        bos_positions = [0] + bos_positions
-    docs: list[tuple[int, int]] = []
-    for i, start in enumerate(bos_positions):
-        end = bos_positions[i + 1] if i + 1 < len(bos_positions) else int(tokens.numel())
-        if include_next_bos and i + 1 < len(bos_positions):
-            end += 1
-        if end - start >= 2:
-            docs.append((int(start), int(end - start)))
-    return docs
-
-
-def _compute_doc_chunk_window(
-    chunk_idx: int,
-    pred_len: int,
-    num_chunks: int,
-    chunk_size: int,
-    eval_seq_len: int,
-) -> tuple[int, int, int, int]:
-    chunk_start = chunk_idx * chunk_size
-    chunk_end = pred_len if chunk_idx == num_chunks - 1 else min((chunk_idx + 1) * chunk_size, pred_len)
-    win_start = max(0, chunk_end - eval_seq_len)
-    win_len = chunk_end - win_start
-    chunk_offset = chunk_start - win_start
-    chunk_len = chunk_end - chunk_start
-    return win_start, win_len, chunk_offset, chunk_len
-
-
-def _accumulate_doc_chunk_bpb(
-    ptl: Tensor,
-    x: Tensor,
-    y: Tensor,
-    batch_i: int,
-    chunk_offset: int,
-    chunk_len: int,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    loss_sum: Tensor,
-    byte_sum: Tensor,
-    token_count: Tensor,
-) -> None:
-    scored = ptl[batch_i, chunk_offset:chunk_offset + chunk_len].to(torch.float64)
-    prev = x[batch_i, chunk_offset:chunk_offset + chunk_len]
-    tgt = y[batch_i, chunk_offset:chunk_offset + chunk_len]
-    tok_bytes = base_bytes_lut[tgt].to(torch.float64)
-    tok_bytes += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-    loss_sum += scored.sum()
-    byte_sum += tok_bytes.sum()
-    token_count += chunk_len
-
-
-def eval_val_doc_isolated(
-    args: Hyperparameters,
-    base_model: GPT,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    bos_id: int,
-    log0=print,
-) -> tuple[float, float]:
-    """Document-aware score-only evaluation with no adaptation."""
-    docs = _find_docs_by_bos(val_tokens, bos_id=bos_id)
-    rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
-    chunk_size = args.ttt_doc_chunk_tokens
-    eval_seq_len = args.ttt_doc_eval_seq_len if args.ttt_doc_eval_seq_len > 0 else args.train_seq_len
-    batch_size = args.ttt_doc_batch_seqs
-
-    if chunk_size <= 0:
-        raise ValueError(f"TTT_DOC_CHUNK_TOKENS must be positive, got {chunk_size}")
-    if eval_seq_len <= 0:
-        raise ValueError(f"TTT_DOC_EVAL_SEQ_LEN must be positive, got {eval_seq_len}")
-    if batch_size <= 0:
-        raise ValueError(f"TTT_DOC_BATCH_SEQS must be positive, got {batch_size}")
-
-    rank_docs.sort(key=lambda d: (d[1] - 2) // chunk_size)
-    log0(
-        f"doc_isolated:start bos_id={bos_id} docs={len(docs)} rank_docs={len(rank_docs)} "
-        f"chunk_tokens={chunk_size} eval_seq_len={eval_seq_len} batch_docs={batch_size}"
-    )
-
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    byte_sum = torch.zeros((), device=device, dtype=torch.float64)
-    token_count = torch.zeros((), device=device, dtype=torch.float64)
-    t0 = time.perf_counter()
-
-    base_model.eval()
-    with torch.inference_mode():
-        for bi in range(0, len(rank_docs), batch_size):
-            batch = rank_docs[bi:bi + batch_size]
-            bsz = len(batch)
-            pred_lens = [doc_len - 1 for _, doc_len in batch]
-            num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
-            max_chunks = max(num_chunks, default=0)
-
-            for ci in range(max_chunks):
-                active_meta: list[tuple[int, int, int, int, int, int]] = []
-                context_size = 0
-                for b, (doc_start, doc_len) in enumerate(batch):
-                    if ci >= num_chunks[b]:
-                        continue
-                    win_start, win_len, chunk_offset, chunk_len = _compute_doc_chunk_window(
-                        ci, pred_lens[b], num_chunks[b], chunk_size, eval_seq_len
-                    )
-                    active_meta.append((b, doc_start, doc_len, win_start, win_len, chunk_offset))
-                    context_size = max(context_size, win_len)
-
-                if not active_meta:
-                    continue
-
-                x = torch.zeros(bsz, context_size, dtype=torch.int64, device=device)
-                y = torch.zeros(bsz, context_size, dtype=torch.int64, device=device)
-                doc_info = [(0, 0)] * bsz
-
-                for b, doc_start, _doc_len, win_start, win_len, chunk_offset in active_meta:
-                    _, _, _, chunk_len = _compute_doc_chunk_window(
-                        ci, pred_lens[b], num_chunks[b], chunk_size, eval_seq_len
-                    )
-                    chunk = val_tokens[doc_start + win_start: doc_start + win_start + win_len + 1]
-                    toks = chunk.to(dtype=torch.int64, device=device)
-                    x[b, :win_len] = toks[:-1]
-                    y[b, :win_len] = toks[1:]
-                    doc_info[b] = (chunk_offset, chunk_len)
-
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(x)
-                ptl = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)).float(),
-                    y.reshape(-1),
-                    reduction="none",
-                ).reshape(bsz, context_size)
-
-                for b, (chunk_offset, chunk_len) in enumerate(doc_info):
-                    if chunk_len > 0:
-                        _accumulate_doc_chunk_bpb(
-                            ptl, x, y, b, chunk_offset, chunk_len,
-                            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                            loss_sum, byte_sum, token_count,
-                        )
-
-            if rank == 0 and (bi == 0 or bi + batch_size >= len(rank_docs) or ((bi // batch_size) % 20 == 0)):
-                elapsed = time.perf_counter() - t0
-                running_loss = loss_sum.item() / max(token_count.item(), 1.0)
-                running_bpb = running_loss / math.log(2.0) * (token_count.item() / max(byte_sum.item(), 1.0))
-                log0(
-                    f"  doc_isolated batch_docs={min(bi + batch_size, len(rank_docs))}/{len(rank_docs)} "
-                    f"bpb={running_bpb:.6f} time={elapsed:.1f}s"
-                )
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(byte_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-
-    val_loss = loss_sum.item() / token_count.item()
-    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_sum.item())
-    base_model.eval()
-
-    log0(f"doc_isolated:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
-         f"elapsed={time.perf_counter() - t0:.1f}s")
-    return val_loss, val_bpb
 
 
 def eval_val_sliding_ttt(
@@ -1432,7 +1323,13 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
 
-def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
+def _unbank_state_dict(
+    sd: dict[str, Tensor],
+    num_layers: int,
+    mlp_dims: tuple[int, ...],
+    mlp_group_ids: tuple[int, ...],
+    mlp_group_rows: tuple[int, ...],
+) -> dict[str, Tensor]:
     """Convert 3D bank tensors into individual 2D tensors with standard names."""
     out: dict[str, Tensor] = {}
     n = num_layers
@@ -1445,17 +1342,29 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
             for i in range(n):
                 out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
                 out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
-        elif name == "mlp_up_bank":
+        elif name.startswith("mlp_up_banks."):
+            gid = int(name.split(".")[1])
             for i in range(n):
-                out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
-        elif name == "mlp_down_bank":
+                if mlp_group_ids[i] == gid:
+                    out[f"blocks.{i}.mlp.fc.weight"] = tensor[mlp_group_rows[i], :mlp_dims[i]]
+        elif name.startswith("mlp_down_banks."):
+            gid = int(name.split(".")[1])
             for i in range(n):
-                out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
+                if mlp_group_ids[i] == gid:
+                    out[f"blocks.{i}.mlp.proj.weight"] = tensor[mlp_group_rows[i], :, :mlp_dims[i]]
         else:
             out[name] = tensor
     return out
 
-def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+def _rebank_state_dict(
+    sd: dict[str, Tensor],
+    num_layers: int,
+    mlp_dims: tuple[int, ...],
+    mlp_group_ids: tuple[int, ...],
+    mlp_group_rows: tuple[int, ...],
+    mlp_group_dims: tuple[int, ...],
+    template_sd: dict[str, Tensor],
+) -> dict[str, Tensor]:
     """Convert individual 2D tensors back into 3D bank tensors."""
     out: dict[str, Tensor] = {}
     n = num_layers
@@ -1492,8 +1401,19 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
             consumed.add(dk)
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
-    out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
-    out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
+    up_banks = [torch.zeros_like(template_sd[f"mlp_up_banks.{gid}"]) for gid in range(len(mlp_group_dims))]
+    down_banks = [torch.zeros_like(template_sd[f"mlp_down_banks.{gid}"]) for gid in range(len(mlp_group_dims))]
+    for i, t in enumerate(up_slices):
+        gid = mlp_group_ids[i]
+        row = mlp_group_rows[i]
+        up_banks[gid][row, :mlp_dims[i]] = t.to(dtype=up_banks[gid].dtype)
+    for i, t in enumerate(down_slices):
+        gid = mlp_group_ids[i]
+        row = mlp_group_rows[i]
+        down_banks[gid][row, :, :mlp_dims[i]] = t.to(dtype=down_banks[gid].dtype)
+    for gid in range(len(mlp_group_dims)):
+        out[f"mlp_up_banks.{gid}"] = up_banks[gid]
+        out[f"mlp_down_banks.{gid}"] = down_banks[gid]
     for name, tensor in sd.items():
         if name not in consumed:
             out[name] = tensor
@@ -1614,9 +1534,6 @@ def main() -> None:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
-    bos_id = args.ttt_bos_id if args.ttt_bos_id >= 0 else int(sp.bos_id())
-    if bos_id < 0:
-        bos_id = 1
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     effective_eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
@@ -1628,7 +1545,6 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    log0(f"ttt_mode:{args.ttt_mode} bos_id:{bos_id}")
     CastedLinear._qat_enabled = args.qat_enabled
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -1637,6 +1553,8 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_mults=args.mlp_mults,
+        mlp_dim_align=args.mlp_dim_align,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1659,8 +1577,10 @@ def main() -> None:
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
-    base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
-    base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+    for p in base_model.mlp_up_banks:
+        p.data = p.data.float()
+    for p in base_model.mlp_down_banks:
+        p.data = p.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1671,13 +1591,13 @@ def main() -> None:
     model = compiled_model
 
     # Optimizer split:
-    # - 4 parameter banks -> Muon (batched Newton-Schulz)
+    # - bank tensors -> Muon (batched Newton-Schulz)
     # - token embedding -> Adam
     # - scalars/control tensors -> Adam
     # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
     matrix_params = [
         base_model.qo_bank, base_model.kv_bank,
-        base_model.mlp_up_bank, base_model.mlp_down_bank,
+        *list(base_model.mlp_up_banks), *list(base_model.mlp_down_banks),
     ]
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
@@ -1748,6 +1668,14 @@ def main() -> None:
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
+    active_mlp_params = sum(2 * args.model_dim * dim for dim in base_model.mlp_dims)
+    dense_mlp_params = 2 * args.num_layers * args.model_dim * int(args.mlp_mult * args.model_dim)
+    log0(
+        f"mlp_schedule mults:{[round(v, 3) for v in base_model.mlp_mults]} "
+        f"dims:{list(base_model.mlp_dims)} align:{base_model.mlp_dim_align} max_dim:{base_model.max_mlp_dim} "
+        f"groups:{list(zip(base_model.mlp_group_dims, base_model.mlp_group_counts))} "
+        f"active_mlp_params:{active_mlp_params} dense_baseline_mlp_params:{dense_mlp_params}"
+    )
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1963,7 +1891,13 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    unbanked_sd = _unbank_state_dict(
+        sd_cpu,
+        args.num_layers,
+        base_model.mlp_dims,
+        base_model.mlp_group_ids,
+        base_model.mlp_group_rows,
+    )
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
@@ -1986,10 +1920,19 @@ def main() -> None:
     )
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
     # Re-bank the dequantized tensors
-    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
+    deq_state = _rebank_state_dict(
+        deq_unbanked,
+        args.num_layers,
+        base_model.mlp_dims,
+        base_model.mlp_group_ids,
+        base_model.mlp_group_rows,
+        base_model.mlp_group_dims,
+        sd_cpu,
+    )
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult, mlp_mults=args.mlp_mults,
+        mlp_dim_align=args.mlp_dim_align,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         mtp_num_heads=0, mtp_loss_weight=0.0,
@@ -2001,8 +1944,10 @@ def main() -> None:
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-    eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
-    eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+    for p in eval_model.mlp_up_banks:
+        p.data = p.data.float()
+    for p in eval_model.mlp_down_banks:
+        p.data = p.data.float()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()
@@ -2038,7 +1983,7 @@ def main() -> None:
             f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-        log0(f"final_int6_lzma_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
     if args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
@@ -2054,31 +1999,20 @@ def main() -> None:
             f"stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms"
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-        log0(f"final_int6_lzma_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-    # Legal score-first TTT
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+    # Legal score-first TTT (PR #461 recipe)
     if args.ttt_enabled:
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
-        if args.ttt_mode in {"doc_isolated", "doc_eval", "doc_only"}:
-            ttt_loss, ttt_bpb = eval_val_doc_isolated(
-                args, eval_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                bos_id=bos_id, log0=log0,
-            )
-            ttt_tag = "doc_isolated_eval"
-        elif args.ttt_mode in {"sliding_sgd", "chunk_sgd"}:
-            ttt_loss, ttt_bpb = eval_val_sliding_ttt(
-                args, eval_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                stride=args.eval_stride, log0=log0,
-            )
-            ttt_tag = "legal_ttt"
-        else:
-            raise ValueError(f"Unsupported TTT_MODE={args.ttt_mode}")
+        ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+            args, eval_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, log0=log0,
+        )
         torch.cuda.synchronize()
-        log0(f"{ttt_tag} val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+        log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
              f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
-        log0(f"{ttt_tag}_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
