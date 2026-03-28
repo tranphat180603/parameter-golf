@@ -1664,6 +1664,19 @@ def main() -> None:
             opt.load_state_dict(state)
         zero_grad_all()
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        post_restore_prewarm_seq_lens = [active_train_seq_len(0.0)]
+        if args.curriculum_enabled and curriculum_stage2_seq_len != post_restore_prewarm_seq_lens[0]:
+            post_restore_prewarm_seq_lens.append(curriculum_stage2_seq_len)
+        for seq_len in post_restore_prewarm_seq_lens:
+            zero_grad_all()
+            for micro_step in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    warm_loss = model(x, y)
+                (warm_loss * grad_scale).backward()
+            zero_grad_all()
+            log0(f"post_restore_prewarm seq_len:{seq_len}")
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     from collections import deque
