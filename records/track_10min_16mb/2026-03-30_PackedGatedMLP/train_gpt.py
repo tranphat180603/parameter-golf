@@ -41,10 +41,6 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    curriculum_enabled = bool(int(os.environ.get("CURRICULUM_ENABLED", "0")))
-    curriculum_stage1_seq_len = int(os.environ.get("CURRICULUM_STAGE1_SEQ_LEN", 1024))
-    curriculum_stage2_seq_len = int(os.environ.get("CURRICULUM_STAGE2_SEQ_LEN", 0))
-    curriculum_switch_fraction = float(os.environ.get("CURRICULUM_SWITCH_FRACTION", 0.25))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -526,11 +522,6 @@ class DistributedTokenLoader:
         self.stream = TokenStream(pattern)
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        if local_tokens % seq_len != 0:
-            raise ValueError(
-                f"local_tokens={local_tokens} must be divisible by seq_len={seq_len}; "
-                f"adjust TRAIN_BATCH_TOKENS or the curriculum schedule"
-            )
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
@@ -597,22 +588,6 @@ class Rotary(nn.Module):
             self._sin_cached = freqs.sin()[None, :, None, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
-
-
-def prime_rotary_caches(module: nn.Module, seq_lens: list[int], device: torch.device, dtype: torch.dtype) -> None:
-    unique_seq_lens: list[int] = []
-    for seq_len in seq_lens:
-        if seq_len > 0 and seq_len not in unique_seq_lens:
-            unique_seq_lens.append(seq_len)
-    if not unique_seq_lens:
-        return
-    with torch.no_grad():
-        for submodule in module.modules():
-            if isinstance(submodule, Rotary):
-                for seq_len in unique_seq_lens:
-                    submodule(seq_len, device, dtype)
-
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
     if rope_dims > 0 and rope_dims < x.size(-1):
         x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
@@ -750,9 +725,11 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         # No CastedLinear -- weights come from banks
-    def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
-        return F.linear(x.square(), down_w.to(x.dtype))
+    def forward(self, x: Tensor, vg_w: Tensor, down_w: Tensor) -> Tensor:
+        vg = F.linear(x, vg_w.to(x.dtype))
+        v, g = vg.chunk(2, dim=-1)
+        g = 2.0 * torch.sigmoid(g)
+        return F.linear(v * g, down_w.to(x.dtype))
 
 class Block(nn.Module):
     def __init__(
@@ -785,12 +762,12 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, vg_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, vg_w, down_w)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -844,12 +821,12 @@ class GPT(nn.Module):
         # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
-        mlp_dim = int(mlp_mult * model_dim)
+        mlp_hidden_dim = int((2.0 / 3.0) * mlp_mult * model_dim)
         self.num_layers = num_layers
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
-        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.mlp_vg_bank = nn.Parameter(torch.empty(num_layers, 2 * mlp_hidden_dim, model_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_hidden_dim))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -908,7 +885,7 @@ class GPT(nn.Module):
             nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
             nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
+            nn.init.orthogonal_(self.mlp_vg_bank.data[i], gain=1.0)    # Packed MLP value+gate
             nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
@@ -944,7 +921,7 @@ class GPT(nn.Module):
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[n + i], self.mlp_vg_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -956,7 +933,7 @@ class GPT(nn.Module):
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[n + bi], self.mlp_vg_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -1002,7 +979,7 @@ class GPT(nn.Module):
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[n + i], self.mlp_vg_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -1014,7 +991,7 @@ class GPT(nn.Module):
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[n + bi], self.mlp_vg_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1298,9 +1275,11 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
             for i in range(n):
                 out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
                 out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
-        elif name == "mlp_up_bank":
+        elif name == "mlp_vg_bank":
             for i in range(n):
-                out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
+                value_w, gate_w = tensor[i].chunk(2, dim=0)
+                out[f"blocks.{i}.mlp.value.weight"] = value_w
+                out[f"blocks.{i}.mlp.gate.weight"] = gate_w
         elif name == "mlp_down_bank":
             for i in range(n):
                 out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
@@ -1315,7 +1294,7 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
     # Reconstruct banks from individual weight keys
     qo_slices = [None] * (2 * n)
     kv_slices = [None] * (2 * n)
-    up_slices = [None] * n
+    vg_slices = [None] * n
     down_slices = [None] * n
     consumed = set()
     for i in range(n):
@@ -1335,17 +1314,19 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
         if vk in sd:
             kv_slices[n + i] = sd[vk]
             consumed.add(vk)
-        fk = f"blocks.{i}.mlp.fc.weight"
-        if fk in sd:
-            up_slices[i] = sd[fk]
-            consumed.add(fk)
+        vk = f"blocks.{i}.mlp.value.weight"
+        gk = f"blocks.{i}.mlp.gate.weight"
+        if vk in sd and gk in sd:
+            vg_slices[i] = torch.cat((sd[vk], sd[gk]), dim=0)
+            consumed.add(vk)
+            consumed.add(gk)
         dk = f"blocks.{i}.mlp.proj.weight"
         if dk in sd:
             down_slices[i] = sd[dk]
             consumed.add(dk)
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
-    out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
+    out["mlp_vg_bank"] = torch.stack(vg_slices).to(dtype=template_sd["mlp_vg_bank"].dtype)
     out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
     for name, tensor in sd.items():
         if name not in consumed:
@@ -1469,19 +1450,8 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    curriculum_stage2_seq_len = args.curriculum_stage2_seq_len if args.curriculum_stage2_seq_len > 0 else args.train_seq_len
-    if args.curriculum_enabled:
-        if args.curriculum_stage1_seq_len <= 0 or curriculum_stage2_seq_len <= 0:
-            raise ValueError("Curriculum sequence lengths must be positive")
-        if not (0.0 <= args.curriculum_switch_fraction <= 1.0):
-            raise ValueError("CURRICULUM_SWITCH_FRACTION must be in [0, 1]")
     effective_eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
-    val_seq_len = max(
-        args.train_seq_len,
-        effective_eval_seq_len,
-        args.curriculum_stage1_seq_len if args.curriculum_enabled else 0,
-        curriculum_stage2_seq_len if args.curriculum_enabled else 0,
-    )
+    val_seq_len = max(args.train_seq_len, effective_eval_seq_len)
     val_tokens = load_validation_tokens(args.val_files, val_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1519,18 +1489,12 @@ def main() -> None:
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
-    base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
+    base_model.mlp_vg_bank.data = base_model.mlp_vg_bank.data.float()
     base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    prime_rotary_caches(
-        base_model,
-        [args.curriculum_stage1_seq_len if args.curriculum_enabled else args.train_seq_len, curriculum_stage2_seq_len, effective_eval_seq_len],
-        device,
-        torch.bfloat16,
-    )
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1543,7 +1507,7 @@ def main() -> None:
     # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
     matrix_params = [
         base_model.qo_bank, base_model.kv_bank,
-        base_model.mlp_up_bank, base_model.mlp_down_bank,
+        base_model.mlp_vg_bank, base_model.mlp_down_bank,
     ]
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
@@ -1629,19 +1593,8 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    if args.curriculum_enabled:
-        curriculum_switch_ms = 1000.0 * args.max_wallclock_seconds * args.curriculum_switch_fraction
-        log0(
-            f"curriculum enabled=1 stage1_seq_len:{args.curriculum_stage1_seq_len} "
-            f"stage2_seq_len:{curriculum_stage2_seq_len} "
-            f"switch_fraction:{args.curriculum_switch_fraction:.3f} switch_ms:{curriculum_switch_ms:.0f}"
-        )
     log0(f"seed:{args.seed}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    def active_train_seq_len(elapsed_ms: float) -> int:
-        if not args.curriculum_enabled:
-            return args.train_seq_len
-        return args.curriculum_stage1_seq_len if elapsed_ms < curriculum_switch_ms else curriculum_stage2_seq_len
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -1660,13 +1613,10 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
-        warmup_seq_plan = [active_train_seq_len(0.0)] * args.warmup_steps
-        if args.curriculum_enabled and curriculum_stage2_seq_len != warmup_seq_plan[0]:
-            warmup_seq_plan.append(curriculum_stage2_seq_len)
-        for warmup_step, warmup_seq_len in enumerate(warmup_seq_plan):
+        for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
-                x, y = train_loader.next_batch(args.train_batch_tokens, warmup_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1678,26 +1628,12 @@ def main() -> None:
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
-            total_warmup_steps = len(warmup_seq_plan)
-            if total_warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == total_warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{total_warmup_steps} seq_len:{warmup_seq_len}")
+            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        post_restore_prewarm_seq_lens = [active_train_seq_len(0.0)]
-        if args.curriculum_enabled and curriculum_stage2_seq_len != post_restore_prewarm_seq_lens[0]:
-            post_restore_prewarm_seq_lens.append(curriculum_stage2_seq_len)
-        for seq_len in post_restore_prewarm_seq_lens:
-            zero_grad_all()
-            for micro_step in range(grad_accum_steps):
-                x, y = train_loader.next_batch(args.train_batch_tokens, seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warm_loss = model(x, y)
-                (warm_loss * grad_scale).backward()
-            zero_grad_all()
-            log0(f"post_restore_prewarm seq_len:{seq_len}")
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
@@ -1707,7 +1643,6 @@ def main() -> None:
     ema_decay = 0.997
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    logged_train_seq_len: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1743,10 +1678,6 @@ def main() -> None:
                 )
             break
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        train_seq_len = active_train_seq_len(elapsed_ms)
-        if train_seq_len != logged_train_seq_len:
-            log0(f"curriculum_switch step:{step} elapsed_ms:{elapsed_ms:.0f} train_seq_len:{train_seq_len}")
-            logged_train_seq_len = train_seq_len
         scale = lr_mul(step, elapsed_ms)
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
@@ -1754,7 +1685,7 @@ def main() -> None:
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
-            x, y = train_loader.next_batch(args.train_batch_tokens, train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -1900,14 +1831,13 @@ def main() -> None:
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-    eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
+    eval_model.mlp_vg_bank.data = eval_model.mlp_vg_bank.data.float()
     eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    prime_rotary_caches(eval_model, [effective_eval_seq_len], device, torch.bfloat16)
     compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
