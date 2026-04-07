@@ -852,9 +852,6 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-INT6_CLIP_RANGE = 31
-INT6_VALUES_PER_PACK = 4
-INT6_BYTES_PER_PACK = 3
 
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
@@ -886,7 +883,7 @@ def restore_fp32_params(model: nn.Module) -> None:
             param.data = param.data.float()
 
 
-def quantize_int6_per_row(t: Tensor, clip_range: int = INT6_CLIP_RANGE) -> tuple[Tensor, Tensor]:
+def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         best_q, best_s, best_err = None, None, float('inf')
@@ -906,68 +903,6 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = INT6_CLIP_RANGE) -> tuple
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
-
-
-def _pack_signed_int6_tensor(q: Tensor, clip_range: int = INT6_CLIP_RANGE) -> Tensor:
-    flat = q.detach().to(dtype=torch.int16, device="cpu").contiguous().reshape(-1)
-    if flat.numel() == 0:
-        return torch.empty(0, dtype=torch.uint8)
-    enc = (flat + clip_range).numpy()
-    if enc.min() < 0 or enc.max() > 2 * clip_range:
-        raise ValueError("int6 tensor contains values outside the expected signed range")
-    enc = enc.astype(np.uint8, copy=False)
-    pad = (-enc.size) % INT6_VALUES_PER_PACK
-    if pad:
-        enc = np.pad(enc, (0, pad))
-    vals = enc.reshape(-1, INT6_VALUES_PER_PACK).astype(np.uint32, copy=False)
-    packed = np.empty((vals.shape[0], INT6_BYTES_PER_PACK), dtype=np.uint8)
-    packed[:, 0] = (vals[:, 0] | ((vals[:, 1] & 0x03) << 6)).astype(np.uint8)
-    packed[:, 1] = (((vals[:, 1] >> 2) & 0x0F) | ((vals[:, 2] & 0x0F) << 4)).astype(np.uint8)
-    packed[:, 2] = (((vals[:, 2] >> 4) & 0x03) | (vals[:, 3] << 2)).astype(np.uint8)
-    return torch.from_numpy(packed.reshape(-1))
-
-
-def _unpack_signed_int6_tensor(
-    packed_q: Tensor,
-    q_shape: list[int] | tuple[int, ...],
-    clip_range: int = INT6_CLIP_RANGE,
-) -> Tensor:
-    numel = math.prod(q_shape)
-    if numel == 0:
-        return torch.empty(q_shape, dtype=torch.int8)
-    packed = packed_q.detach().to(dtype=torch.uint8, device="cpu").contiguous().numpy()
-    if packed.size % INT6_BYTES_PER_PACK != 0:
-        raise ValueError("packed int6 payload has an invalid byte length")
-    blocks = packed.reshape(-1, INT6_BYTES_PER_PACK).astype(np.uint32, copy=False)
-    vals = np.empty((blocks.shape[0], INT6_VALUES_PER_PACK), dtype=np.uint8)
-    vals[:, 0] = (blocks[:, 0] & 0x3F).astype(np.uint8)
-    vals[:, 1] = (((blocks[:, 0] >> 6) | ((blocks[:, 1] & 0x0F) << 2)) & 0x3F).astype(np.uint8)
-    vals[:, 2] = (((blocks[:, 1] >> 4) | ((blocks[:, 2] & 0x03) << 4)) & 0x3F).astype(np.uint8)
-    vals[:, 3] = ((blocks[:, 2] >> 2) & 0x3F).astype(np.uint8)
-    flat = vals.reshape(-1)[:numel].astype(np.int16, copy=False) - clip_range
-    return torch.from_numpy(flat.astype(np.int8, copy=False)).reshape(*q_shape)
-
-
-def _store_int6_tensor(
-    result: dict[str, Tensor],
-    meta: dict[str, object],
-    name: str,
-    q: Tensor,
-    s: Tensor,
-    info: dict[str, object] | None = None,
-    clip_range: int = INT6_CLIP_RANGE,
-) -> None:
-    q_cpu = q.detach().to(dtype=torch.int8, device="cpu").contiguous()
-    packed_q = _pack_signed_int6_tensor(q_cpu, clip_range=clip_range)
-    unpacked_q = _unpack_signed_int6_tensor(packed_q, tuple(q_cpu.shape), clip_range=clip_range)
-    if not torch.equal(unpacked_q, q_cpu):
-        raise RuntimeError(f"Packed int6 roundtrip mismatch for tensor {name}")
-    result[name + ".q"] = packed_q
-    result[name + ".scale"] = s
-    packed_info = {"type": "int6", "packed_q": True, "q_shape": list(q_cpu.shape), "clip_range": clip_range}
-    if info:
-        packed_info.update(info)
-    meta[name] = packed_info
 
 
 def collect_hessians(
@@ -1113,15 +1048,18 @@ def gptq_mixed_quantize_int6(
             if name in hessians:
                 q, s = gptq_quantize_weight(t, hessians[name])
                 gptq_count += 1
-                info = {"method": "gptq"}
+                meta[name] = {"type": "int6", "method": "gptq"}
             else:
                 q, s = quantize_int6_per_row(t)
                 fallback_count += 1
-                info = {"method": "clip_search"}
-            _store_int6_tensor(result, meta, name, q, s, info=info)
+                meta[name] = {"type": "int6", "method": "clip_search"}
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
         elif cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
-            _store_int6_tensor(result, meta, name, q, s)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int6"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -1148,7 +1086,9 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             continue
         if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
-            _store_int6_tensor(result, meta, name, q, s)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int6"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -1172,12 +1112,6 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             out[name] = t
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
-        if isinstance(info, dict) and info.get("packed_q"):
-            q = _unpack_signed_int6_tensor(
-                q,
-                tuple(info["q_shape"]),
-                clip_range=int(info.get("clip_range", INT6_CLIP_RANGE)),
-            )
         if s.ndim > 0:
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
         else:
