@@ -589,7 +589,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None] #[bsz, seqlen, numheads, headdim]
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None] #[bsz, numheads, bsz, headdim]
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -612,7 +612,8 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        # x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5).square() #test with leakyrelu
         return self.proj(x.square())
 
 
