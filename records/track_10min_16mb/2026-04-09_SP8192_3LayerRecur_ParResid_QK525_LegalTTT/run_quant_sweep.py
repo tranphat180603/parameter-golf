@@ -41,6 +41,13 @@ def _write_override(path: Path, tensor_name: str, bits: int, clip_sigmas: float)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _find_repo_root(start: Path) -> Path:
+    for candidate in (start, *start.parents):
+        if (candidate / "data").is_dir() and (candidate / "records").is_dir():
+            return candidate
+    raise RuntimeError(f"Could not find repo root above {start}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a single-GPU quantization sweep family.")
     parser.add_argument("--family", choices=("attn", "mlp"), required=True)
@@ -50,7 +57,7 @@ def main() -> int:
     args = parser.parse_args()
 
     record_dir = Path(__file__).resolve().parent
-    repo_root = record_dir.parents[1]
+    repo_root = _find_repo_root(record_dir)
     train_script = record_dir / "train_gpt_human.py"
     score_script = record_dir / "score_quant_sweeps.py"
     root = record_dir / "sweeps" / args.family / args.tag
