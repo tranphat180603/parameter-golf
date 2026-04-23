@@ -6,7 +6,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor,nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 QUANT_OVERRIDES={
-    "blocks.10.mlp.proj.weight":{"bits":6,"clip_sigmas":15.5},
+    "blocks.10.mlp.proj.weight":{"bits":7,"clip_sigmas":15.5},
     "blocks.0.attn.c_v.weight":{"bits":7,"clip_sigmas":10.5},
 }
 class Hyperparameters:
