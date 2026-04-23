@@ -5,6 +5,12 @@ import constriction
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor,nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
+QUANT_OVERRIDES={
+    "blocks.9.attn.c_q.weight":{"bits":7},
+    "blocks.9.attn.c_v.weight":{"bits":7},
+    "blocks.10.attn.proj.weight":{"bits":7},
+    "blocks.0.attn.c_q.weight":{"bits":7},
+}
 class Hyperparameters:
     data_dir=os.environ.get('DATA_DIR','./data/')
     seed=int(os.environ.get('SEED',1337))
@@ -622,14 +628,18 @@ def gptq_quantize_weight(w,H,clip_sigmas=3.,clip_range=63,block_size=128):
 def gptq_mixed_quantize(state_dict,hessians,h):
     result={}
     meta={}
+    used_overrides={}
     for(name,tensor)in state_dict.items():
         t=tensor.detach().cpu().contiguous()
         if not t.is_floating_point()or t.numel()<=65536:
             result[name]=t.to(torch.float16)if t.is_floating_point()else t
             meta[name]='passthrough (float16)'
             continue
-        cs=h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas
-        bits=h.embed_bits if'tok_emb'in name else h.matrix_bits
+        override=QUANT_OVERRIDES.get(name,{})
+        cs=override.get('clip_sigmas',h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas)
+        bits=override.get('bits',h.embed_bits if'tok_emb'in name else h.matrix_bits)
+        if override:
+            used_overrides[name]=dict(override)
         q,s=gptq_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=2**(bits-1)-1)
         result[name+'.q']=q
         result[name+'.scale']=s
@@ -641,6 +651,11 @@ def gptq_mixed_quantize(state_dict,hessians,h):
     log('Quantized weights:')
     for cat in sorted(categories):
         log(f"  {cat}: {', '.join(sorted(categories[cat]))}")
+    if used_overrides:
+        log('Quantization overrides:')
+        for name in sorted(used_overrides):
+            opts=', '.join(f"{k}={v}" for(k,v)in sorted(used_overrides[name].items()))
+            log(f"  {name}: {opts}")
     return result,meta
 def dequantize_mixed(result,meta,template_sd):
     out={}
@@ -950,25 +965,27 @@ def eval_val_sliding(h,device,val_data,base_model,batch_seqs=32):
             x_batch=torch.zeros(bsz,seq_len,dtype=torch.int64,device=device)
             y_batch=torch.zeros(bsz,seq_len,dtype=torch.int64,device=device)
             wlens=[]
-            for(i,ws)in enumerate(batch_ws):we=min(ws+seq_len,total_tokens)
-            wlen=we-ws
-            wlens.append(wlen)
-            chunk=val_data.val_tokens[ws:we+1].to(dtype=torch.int64,device=device)
-            x_batch[i,:wlen]=chunk[:-1]
-            y_batch[i,:wlen]=chunk[1:]
+            for(i,ws)in enumerate(batch_ws):
+                we=min(ws+seq_len,total_tokens)
+                wlen=we-ws
+                wlens.append(wlen)
+                chunk=val_data.val_tokens[ws:we+1].to(dtype=torch.int64,device=device)
+                x_batch[i,:wlen]=chunk[:-1]
+                y_batch[i,:wlen]=chunk[1:]
             with torch.autocast(device_type='cuda',dtype=torch.bfloat16):
                 logits=logits_fn(x_batch)
             nll=F.cross_entropy(logits.reshape(-1,logits.size(-1)).float(),y_batch.reshape(-1),reduction='none').reshape(bsz,seq_len)
-            for(i,ws)in enumerate(batch_ws):wlen=wlens[i]
-            s=0 if ws==0 else context_size
-            scored_nll=nll[i,s:wlen].to(torch.float64)
-            loss_sum+=scored_nll.sum()
-            token_count+=float(wlen-s)
-            tgt=y_batch[i,s:wlen]
-            prev=x_batch[i,s:wlen]
-            tb=val_data.base_bytes_lut[tgt].to(torch.float64)
-            tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64)
-            byte_count+=tb.sum()
+            for(i,ws)in enumerate(batch_ws):
+                wlen=wlens[i]
+                s=0 if ws==0 else context_size
+                scored_nll=nll[i,s:wlen].to(torch.float64)
+                loss_sum+=scored_nll.sum()
+                token_count+=float(wlen-s)
+                tgt=y_batch[i,s:wlen]
+                prev=x_batch[i,s:wlen]
+                tb=val_data.base_bytes_lut[tgt].to(torch.float64)
+                tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count+=tb.sum()
     if dist.is_available()and dist.is_initialized():
         dist.all_reduce(loss_sum,op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count,op=dist.ReduceOp.SUM)
@@ -1018,25 +1035,27 @@ def eval_val_ttt(h,device,val_data,base_model,batch_seqs=32):
                 x_batch=torch.zeros(bsz,seq_len,dtype=torch.int64,device=device)
                 y_batch=torch.zeros(bsz,seq_len,dtype=torch.int64,device=device)
                 wlens=[]
-                for(i,ws)in enumerate(batch_ws):we=min(ws+seq_len,total_tokens)
-                wlen=we-ws
-                wlens.append(wlen)
-                chunk_tok=val_data.val_tokens[ws:we+1].to(dtype=torch.int64,device=device)
-                x_batch[i,:wlen]=chunk_tok[:-1]
-                y_batch[i,:wlen]=chunk_tok[1:]
+                for(i,ws)in enumerate(batch_ws):
+                    we=min(ws+seq_len,total_tokens)
+                    wlen=we-ws
+                    wlens.append(wlen)
+                    chunk_tok=val_data.val_tokens[ws:we+1].to(dtype=torch.int64,device=device)
+                    x_batch[i,:wlen]=chunk_tok[:-1]
+                    y_batch[i,:wlen]=chunk_tok[1:]
                 with torch.autocast(device_type='cuda',dtype=torch.bfloat16):
                     logits=compiled_logits(x_batch)
                 nll=F.cross_entropy(logits.reshape(-1,logits.size(-1)).float(),y_batch.reshape(-1),reduction='none').reshape(bsz,seq_len)
-                for(i,ws)in enumerate(batch_ws):wlen=wlens[i]
-                s=0 if ws==0 else context_size
-                scored_nll=nll[i,s:wlen].to(torch.float64)
-                loss_sum+=scored_nll.sum()
-                token_count+=float(wlen-s)
-                tgt=y_batch[i,s:wlen]
-                prev=x_batch[i,s:wlen]
-                tb=val_data.base_bytes_lut[tgt].to(torch.float64)
-                tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count+=tb.sum()
+                for(i,ws)in enumerate(batch_ws):
+                    wlen=wlens[i]
+                    s=0 if ws==0 else context_size
+                    scored_nll=nll[i,s:wlen].to(torch.float64)
+                    loss_sum+=scored_nll.sum()
+                    token_count+=float(wlen-s)
+                    tgt=y_batch[i,s:wlen]
+                    prev=x_batch[i,s:wlen]
+                    tb=val_data.base_bytes_lut[tgt].to(torch.float64)
+                    tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count+=tb.sum()
         is_last_chunk=ci==num_chunks-1
         if not is_last_chunk and h.ttt_epochs>0:
             base_model.train()
