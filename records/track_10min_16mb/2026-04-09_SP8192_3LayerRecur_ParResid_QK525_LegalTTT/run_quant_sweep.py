@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import argparse
 import json
 import os
@@ -39,6 +40,39 @@ CONFIG_PRESETS = {
     ),
 }
 
+COMBO_PRESETS = {
+    "mlp_proj15p5_attn_cv_grid": (
+        (
+            "proj15p5_cv10p5",
+            {
+                "blocks.10.mlp.proj.weight": {"bits": 6, "clip_sigmas": 15.5},
+                "blocks.0.attn.c_v.weight": {"bits": 7, "clip_sigmas": 10.5},
+            },
+        ),
+        (
+            "proj15p5_cv11p0",
+            {
+                "blocks.10.mlp.proj.weight": {"bits": 6, "clip_sigmas": 15.5},
+                "blocks.0.attn.c_v.weight": {"bits": 7, "clip_sigmas": 11.0},
+            },
+        ),
+        (
+            "proj15p5_cv11p5",
+            {
+                "blocks.10.mlp.proj.weight": {"bits": 6, "clip_sigmas": 15.5},
+                "blocks.0.attn.c_v.weight": {"bits": 7, "clip_sigmas": 11.5},
+            },
+        ),
+        (
+            "proj15p5_cv12p0",
+            {
+                "blocks.10.mlp.proj.weight": {"bits": 6, "clip_sigmas": 15.5},
+                "blocks.0.attn.c_v.weight": {"bits": 7, "clip_sigmas": 12.0},
+            },
+        ),
+    ),
+}
+
 
 def _candidate_list(family: str) -> tuple[str, ...]:
     if family == "attn":
@@ -59,9 +93,8 @@ def _tensor_slug(name: str) -> str:
     return name.replace("/", "_")
 
 
-def _write_override(path: Path, tensor_name: str, override: dict[str, float | int]) -> None:
+def _write_override(path: Path, payload: dict[str, dict[str, float | int]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {tensor_name: override}
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
@@ -92,6 +125,7 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--family", choices=("attn", "mlp"), help="Sweep a built-in family candidate list.")
     mode.add_argument("--tensor", help="Sweep a single tensor across one or more override configs.")
+    mode.add_argument("--combo-preset", choices=tuple(COMBO_PRESETS), help="Run a predefined multi-tensor sweep grid.")
     parser.add_argument("--bits", type=int, default=7, help="Bit width for family sweeps or single-config tensor sweeps.")
     parser.add_argument("--clip-sigmas", type=float, help="Clip sigmas for family sweeps or single-config tensor sweeps.")
     parser.add_argument("--config-preset", choices=tuple(CONFIG_PRESETS), help="Named config grid for --tensor mode.")
@@ -106,6 +140,10 @@ def main() -> int:
         raise SystemExit("--shard-index must be in [0, num_shards)")
     if args.family and args.config_preset:
         raise SystemExit("--config-preset only applies to --tensor mode")
+    if args.combo_preset and args.config_preset:
+        raise SystemExit("--config-preset only applies to --tensor mode")
+    if args.family and args.num_shards != 1:
+        raise SystemExit("--num-shards only applies to --tensor or --combo-preset mode")
 
     record_dir = Path(__file__).resolve().parent
     repo_root = _find_repo_root(record_dir)
@@ -121,17 +159,25 @@ def main() -> int:
         elif args.family in ("attn", "mlp"):
             override["clip_sigmas"] = 11.5
         for tensor_name in _candidate_list(args.family):
-            run_specs.append((tensor_name, tensor_name, dict(override)))
+            run_specs.append((tensor_name, {tensor_name: dict(override)}))
         mode_label = f"family={args.family}"
-    else:
+    elif args.tensor:
         tensor_slug = _tensor_slug(args.tensor)
         root = record_dir / "sweeps" / "custom" / tensor_slug / args.tag
         all_configs = _single_tensor_runs(args.tensor, args.config_preset, args.bits, args.clip_sigmas)
         selected_configs = _split_chunk(all_configs, args.num_shards, args.shard_index)
         if args.num_shards > 1:
             root = root / f"shard_{args.shard_index + 1}_of_{args.num_shards}"
-        run_specs = [(args.tensor, label, override) for (label, override) in selected_configs]
+        run_specs = [(label, {args.tensor: override}) for (label, override) in selected_configs]
         mode_label = f"tensor={args.tensor}"
+    else:
+        root = record_dir / "sweeps" / "combos" / args.combo_preset / args.tag
+        all_configs = [(label, dict(payload)) for (label, payload) in COMBO_PRESETS[args.combo_preset]]
+        selected_configs = _split_chunk(all_configs, args.num_shards, args.shard_index)
+        if args.num_shards > 1:
+            root = root / f"shard_{args.shard_index + 1}_of_{args.num_shards}"
+        run_specs = selected_configs
+        mode_label = f"combo={args.combo_preset}"
 
     override_dir = root / "overrides"
     log_dir = root / "logs"
@@ -142,19 +188,18 @@ def main() -> int:
 
     print(mode_label)
     print(f"Output root: {root}")
-    if args.tensor:
+    if args.tensor or args.combo_preset:
         print(f"Shard: {args.shard_index + 1}/{args.num_shards}")
     if not run_specs:
         print("No configs selected for this shard.")
         return 0
 
-    for tensor_name, label, override in run_specs:
-        stem = label if args.tensor else tensor_name
+    for stem, override_payload in run_specs:
         override_path = override_dir / f"{stem}.json"
         log_path = log_dir / f"{stem}.log"
         model_path = model_dir / f"{stem}.pt"
         artifact_path = artifact_dir / f"{stem}.ptz"
-        _write_override(override_path, tensor_name, override)
+        _write_override(override_path, override_payload)
         env = os.environ.copy()
         env["RUN_ID"] = stem
         env["QUANT_OVERRIDE_PATH"] = str(override_path)
@@ -164,8 +209,12 @@ def main() -> int:
         env.setdefault("PYTHONUNBUFFERED", "1")
         print()
         print(f"=== {stem} ===")
-        print(f"tensor: {tensor_name}")
-        print(f"override: {json.dumps(override, sort_keys=True)}")
+        if len(override_payload) == 1:
+            tensor_name = next(iter(override_payload))
+            print(f"tensor: {tensor_name}")
+        else:
+            print(f"tensors: {', '.join(sorted(override_payload))}")
+        print(f"override: {json.dumps(override_payload, sort_keys=True)}")
         print(f"log: {log_path}")
         subprocess.run([sys.executable, str(train_script)], cwd=repo_root, env=env, check=True)
 
