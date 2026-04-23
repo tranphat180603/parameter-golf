@@ -123,6 +123,13 @@ def _quant_overrides_for(h):
     if h.quant_override_path:
         return _load_quant_overrides(h.quant_override_path)
     return QUANT_OVERRIDES
+def _format_quant_override(opts):
+    parts=[]
+    if 'bits' in opts:
+        parts.append(f"bits={opts['bits']}")
+    if 'clip_sigmas' in opts:
+        parts.append(f"clip_sigmas={opts['clip_sigmas']}")
+    return ', '.join(parts) if parts else '(empty)'
 def set_logging_hparams(h):
     global _logger_hparams
     _logger_hparams=h
@@ -1321,6 +1328,13 @@ def main():
         for(k,v)in sorted(vars(type(h)).items()):
             if not k.startswith('_'):
                 log(f"  {k}: {v}",console=True)
+        active_quant_overrides=_quant_overrides_for(h)
+        log('Active quantization overrides:',console=True)
+        if active_quant_overrides:
+            for(name,opts)in sorted(active_quant_overrides.items()):
+                log(f"  {name}: {_format_quant_override(opts)}",console=True)
+        else:
+            log('  (none)',console=True)
         log('='*100,console=False)
         log(f"Running Python {sys.version}",console=False)
         log(f"Running PyTorch {torch.__version__}",console=False)
