@@ -1,4 +1,4 @@
-import collections,copy,glob,io,lzma,math,os
+import collections,copy,glob,io,json,lzma,math,os
 from pathlib import Path
 import random,re,subprocess,sys,time,uuid,numpy as np,sentencepiece as spm,torch,torch.distributed as dist,torch.nn.functional as F
 import constriction
@@ -6,10 +6,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor,nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 QUANT_OVERRIDES={
-    "blocks.9.attn.c_q.weight":{"bits":7},
-    "blocks.9.attn.c_v.weight":{"bits":7},
-    "blocks.10.attn.proj.weight":{"bits":7},
-    "blocks.0.attn.c_q.weight":{"bits":7},
+    "blocks.9.attn.c_q.weight":{"bits":7,"clip_sigmas":11.5},
+    "blocks.9.attn.c_v.weight":{"bits":7,"clip_sigmas":11.5},
+    "blocks.10.mlp.proj.weight":{"bits":7,"clip_sigmas":11.5},
+    "blocks.0.attn.c_q.weight":{"bits":7,"clip_sigmas":11.5},
 }
 class Hyperparameters:
     data_dir=os.environ.get('DATA_DIR','./data/')
@@ -95,13 +95,41 @@ class Hyperparameters:
     train_files=os.path.join(datasets_dir,'fineweb_train_*.bin')
     val_files=os.path.join(datasets_dir,'fineweb_val_*.bin')
     tokenizer_path=os.path.join(data_dir,'tokenizers',f"fineweb_{vocab_size}_bpe.model")
-    logfile=f"logs/{run_id}.txt"
-    model_path='final_model.pt'
-    quantized_model_path='final_model.int6.ptz'
+    quant_override_path=os.environ.get('QUANT_OVERRIDE_PATH')
+    logfile=os.environ.get('LOGFILE',f"logs/{run_id}.txt")
+    model_path=os.environ.get('MODEL_PATH','final_model.pt')
+    quantized_model_path=os.environ.get('QUANTIZED_MODEL_PATH','final_model.int6.ptz')
 _logger_hparams=None
+_quant_override_cache={}
+def _ensure_parent_dir(path):
+    Path(path).expanduser().resolve().parent.mkdir(parents=True,exist_ok=True)
+def _load_quant_overrides(path):
+    if path in _quant_override_cache:
+        return _quant_override_cache[path]
+    data=json.loads(Path(path).expanduser().read_text(encoding='utf-8'))
+    if not isinstance(data,dict):
+        raise TypeError(f"Override file must contain a JSON object: {path}")
+    out={}
+    for(name,opts)in data.items():
+        if not isinstance(name,str)or not isinstance(opts,dict):
+            raise TypeError(f"Override entries must map string names to option objects: {path}")
+        parsed={}
+        if 'bits'in opts:
+            parsed['bits']=int(opts['bits'])
+        if 'clip_sigmas'in opts:
+            parsed['clip_sigmas']=float(opts['clip_sigmas'])
+        out[name]=parsed
+    _quant_override_cache[path]=out
+    return out
+def _quant_overrides_for(h):
+    if h.quant_override_path:
+        return _load_quant_overrides(h.quant_override_path)
+    return QUANT_OVERRIDES
 def set_logging_hparams(h):
     global _logger_hparams
     _logger_hparams=h
+    if h.logfile is not None:
+        _ensure_parent_dir(h.logfile)
 def log(msg,console=True):
     if _logger_hparams is None:
         print(msg)
@@ -629,13 +657,14 @@ def gptq_mixed_quantize(state_dict,hessians,h):
     result={}
     meta={}
     used_overrides={}
+    override_map=_quant_overrides_for(h)
     for(name,tensor)in state_dict.items():
         t=tensor.detach().cpu().contiguous()
         if not t.is_floating_point()or t.numel()<=65536:
             result[name]=t.to(torch.float16)if t.is_floating_point()else t
             meta[name]='passthrough (float16)'
             continue
-        override=QUANT_OVERRIDES.get(name,{})
+        override=override_map.get(name,{})
         cs=override.get('clip_sigmas',h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas)
         bits=override.get('bits',h.embed_bits if'tok_emb'in name else h.matrix_bits)
         if override:
@@ -868,6 +897,7 @@ def _decode_artifact(blob,template_sd):
 def serialize(h,base_model,code):
     code_bytes=len(code.encode('utf-8'))
     if h.is_main_process:
+        _ensure_parent_dir(h.model_path)
         torch.save(base_model.state_dict(),h.model_path)
         model_bytes=os.path.getsize(h.model_path)
         log(f"Serialized model: {model_bytes} bytes")
@@ -884,6 +914,7 @@ def serialize(h,base_model,code):
     quant_file_bytes=len(quant_blob)
     bytes_total=quant_file_bytes+code_bytes
     if h.is_main_process:
+        _ensure_parent_dir(h.quantized_model_path)
         with open(h.quantized_model_path,'wb')as f:
             f.write(quant_blob)
         log(f"Serialized model quantized+ans: {quant_file_bytes} bytes")
