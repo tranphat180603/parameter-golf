@@ -32,10 +32,10 @@ CONFIG_PRESETS = {
         ("b7_cs11p5", {"bits": 7, "clip_sigmas": 11.5}),
         ("b7_cs10p5", {"bits": 7, "clip_sigmas": 10.5}),
         ("b7_cs9p5", {"bits": 7, "clip_sigmas": 9.5}),
-        ("b8", {"bits": 8}),
-        ("b8_cs12p85", {"bits": 8, "clip_sigmas": 12.85}),
-        ("b8_cs11p5", {"bits": 8, "clip_sigmas": 11.5}),
-        ("b8_cs10p5", {"bits": 8, "clip_sigmas": 10.5}),
+        ("b6", {"bits": 6}),
+        ("b6_cs13p5", {"bits": 6, "clip_sigmas": 13.5}),
+        ("b6_cs14p5", {"bits": 6, "clip_sigmas": 14.5}),
+        ("b6_cs15p5", {"bits": 6, "clip_sigmas": 15.5}),
     ),
 }
 

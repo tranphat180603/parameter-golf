@@ -819,7 +819,7 @@ def _encode_artifact(template_sd,quant_result,quant_meta):
         symbols=(q.to(torch.int32).reshape(-1).numpy()+clip_range).astype(np.int32,copy=False)
         alphabet_size=2*clip_range+1
         counts=np.bincount(symbols,minlength=alphabet_size).astype(np.uint32,copy=False)
-        model=constriction.stream.model.Categorical(counts.astype(np.float64),perfect=False)
+        model=constriction.stream.model.Categorical(counts.astype(np.float64),perfect=True)
         coder=constriction.stream.stack.AnsCoder()
         coder.encode_reverse(symbols,model)
         words=np.asarray(coder.get_compressed(),dtype=np.uint32)
@@ -872,7 +872,7 @@ def _decode_artifact(blob,template_sd):
         words=np.frombuffer(words_raw,dtype='<u4').astype(np.uint32,copy=False)
         clip_range=(alphabet_size-1)//2
         bits=int(round(math.log2(alphabet_size+1)))
-        model=constriction.stream.model.Categorical(counts.astype(np.float64),perfect=False)
+        model=constriction.stream.model.Categorical(counts.astype(np.float64),perfect=True)
         coder=constriction.stream.stack.AnsCoder(words)
         symbols=np.asarray(coder.decode(model,symbol_count),dtype=np.int32)
         q_values=(symbols-clip_range).reshape(tuple(orig.shape))
