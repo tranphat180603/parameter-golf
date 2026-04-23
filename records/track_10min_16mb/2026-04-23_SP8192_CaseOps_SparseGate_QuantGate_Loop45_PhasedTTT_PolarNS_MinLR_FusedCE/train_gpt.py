@@ -292,7 +292,7 @@ class Hyperparameters:
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
     ttt_grad_steps = int(os.environ.get("TTT_GRAD_STEPS", 1))
-    ttt_weight_decay = float(os.environ.get("TTT_WEIGHT_DECAY", 0.5))
+    ttt_weight_decay = float(os.environ.get("TTT_WEIGHT_DECAY", 1.0))
     ttt_beta1 = float(os.environ.get("TTT_BETA1", 0))
     ttt_beta2 = float(os.environ.get("TTT_BETA2", 0.999))
     ttt_k_lora = bool(int(os.environ.get("TTT_K_LORA", "1")))
@@ -1624,9 +1624,17 @@ class GPT(nn.Module):
 
 
 class BatchedLinearLoRA(nn.Module):
+    # PR-1767: rank-scaled output (alpha/rank), like standard LoRA. Decouples
+    # effective magnitude from rank so changing rank does not change LR scale.
+    _ALPHA = float(os.environ.get("TTT_LORA_ALPHA", "144"))
+    # PR-1767: optionally keep A warm across per-doc resets (only B is zeroed).
+    # Accumulates useful feature directions across documents within a TTT phase.
+    _WARM_START_A = bool(int(os.environ.get("TTT_WARM_START_A", "1")))
+
     def __init__(self, bsz, in_features, out_features, rank):
         super().__init__()
         self._bound = 1.0 / math.sqrt(in_features)
+        self._scale = self._ALPHA / rank
         self.A = nn.Parameter(
             torch.empty(bsz, rank, in_features).uniform_(-self._bound, self._bound)
         )
@@ -1634,11 +1642,12 @@ class BatchedLinearLoRA(nn.Module):
 
     def reset(self):
         with torch.no_grad():
-            self.A.uniform_(-self._bound, self._bound)
+            if not self._WARM_START_A:
+                self.A.uniform_(-self._bound, self._bound)
             self.B.zero_()
 
     def forward(self, x):
-        return (x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)
+        return ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)) * self._scale
 
 
 class BatchedTTTLoRA(nn.Module):
@@ -3279,43 +3288,57 @@ def train_and_eval(h, device):
         f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}"
     )
     log(f"val_tokens: {val_data.val_tokens.numel()-1}")
-    base_model, compiled_model, compiled_forward_logits = train_model(
-        h, device, val_data
-    )
-    torch._dynamo.reset()
-    timed_eval(
-        "diagnostic pre-quantization post-ema",
-        eval_val,
-        h,
-        device,
-        val_data,
-        compiled_model,
-        compiled_forward_logits,
-    )
-    if os.environ.get("PREQUANT_ONLY", "0") == "1":
-        log("PREQUANT_ONLY=1 — skipping serialize/GPTQ/post-quant eval/TTT")
-        return
-    serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
-    if h.distributed:
-        dist.barrier()
+    # TTT_EVAL_ONLY: skip training + GPTQ, jump straight to TTT eval on a
+    # pre-existing quantized artifact. Used to test TTT-only improvements
+    # (e.g., PR-1767's alpha/warm-start/WD) without retraining.
+    ttt_eval_only = os.environ.get("TTT_EVAL_ONLY", "0") == "1"
+    if ttt_eval_only:
+        log("TTT_EVAL_ONLY=1 — skipping training + GPTQ, loading saved artifact for TTT eval")
+        log(f"ttt_lora_alpha: {BatchedLinearLoRA._ALPHA}")
+        log(f"ttt_warm_start_a: {BatchedLinearLoRA._WARM_START_A}")
+        log(f"ttt_weight_decay: {h.ttt_weight_decay}")
+    else:
+        base_model, compiled_model, compiled_forward_logits = train_model(
+            h, device, val_data
+        )
+        torch._dynamo.reset()
+        timed_eval(
+            "diagnostic pre-quantization post-ema",
+            eval_val,
+            h,
+            device,
+            val_data,
+            compiled_model,
+            compiled_forward_logits,
+        )
+        if os.environ.get("PREQUANT_ONLY", "0") == "1":
+            log("PREQUANT_ONLY=1 — skipping serialize/GPTQ/post-quant eval/TTT")
+            return
+        serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
+        if h.distributed:
+            dist.barrier()
     eval_model = deserialize(h, device)
     if h.num_loops > 0:
         eval_model.looping_active = True
-    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
-    compiled_forward_logits = torch.compile(
-        eval_model.forward_logits, dynamic=False, fullgraph=True
-    )
-    timed_eval(
-        "diagnostic quantized",
-        eval_val,
-        h,
-        device,
-        val_data,
-        compiled_model,
-        compiled_forward_logits,
-    )
+    if not ttt_eval_only:
+        compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
+        compiled_forward_logits = torch.compile(
+            eval_model.forward_logits, dynamic=False, fullgraph=True
+        )
+        timed_eval(
+            "diagnostic quantized",
+            eval_val,
+            h,
+            device,
+            val_data,
+            compiled_model,
+            compiled_forward_logits,
+        )
+        del eval_model
     if h.ttt_enabled:
-        del eval_model, compiled_model
+        if not ttt_eval_only:
+            del compiled_model
+        del eval_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)
