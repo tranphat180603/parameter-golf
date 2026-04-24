@@ -17,6 +17,7 @@ class Hyperparameters:
     train_seq_len=int(os.environ.get('TRAIN_SEQ_LEN',2048))
     train_log_every=int(os.environ.get('TRAIN_LOG_EVERY',500))
     max_wallclock_seconds=float(os.environ.get('MAX_WALLCLOCK_SECONDS',6e2))
+    quantize_only=bool(int(os.environ.get('QUANTIZE_ONLY','0')))
     val_batch_tokens=int(os.environ.get('VAL_BATCH_TOKENS',524288))
     eval_seq_len=int(os.environ.get('EVAL_SEQ_LEN',2048))
     val_loss_every=int(os.environ.get('VAL_LOSS_EVERY',4000))
@@ -79,7 +80,7 @@ class Hyperparameters:
     gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.))
     matrix_bits=int(os.environ.get('MATRIX_BITS',6))
     embed_bits=int(os.environ.get('EMBED_BITS',8))
-    matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',14.5))
+    matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',15.5))
     embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1))
     distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ
     rank=int(os.environ.get('RANK','0'))
@@ -1264,6 +1265,16 @@ def train_and_eval(h,device):
     np.random.seed(h.seed)
     torch.manual_seed(h.seed)
     torch.cuda.manual_seed_all(h.seed)
+    if h.quantize_only:
+        if not Path(h.model_path).exists():
+            raise FileNotFoundError(f"MODEL_PATH not found for quantize-only mode: {h.model_path}")
+        log(f"quantize_only: loading checkpoint from {h.model_path}")
+        base_model=GPT(h).to(device).bfloat16()
+        restore_fp32_params(base_model)
+        sd=torch.load(h.model_path,map_location='cpu')
+        base_model.load_state_dict(sd,strict=True)
+        serialize(h,base_model,Path(__file__).read_text(encoding='utf-8'))
+        return
     val_data=ValidationData(h,device)
     log(f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}")
     log(f"val_tokens: {val_data.val_tokens.numel()-1}")
