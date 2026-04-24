@@ -40,6 +40,7 @@ class Hyperparameters:
     num_loops=int(os.environ.get('NUM_LOOPS',2))
     loop_start=int(os.environ.get('LOOP_START',3))
     loop_end=int(os.environ.get('LOOP_END',5))
+    loop_split=int(os.environ.get('LOOP_SPLIT',-1))
     enable_looping_at=float(os.environ.get('ENABLE_LOOPING_AT',.35))
     parallel_residual_start=int(os.environ.get('PARALLEL_RESIDUAL_START',7))
     min_lr=float(os.environ.get('MIN_LR',.0))
@@ -423,7 +424,9 @@ class GPT(nn.Module):
             for _ in range(h.num_loops+1):
                 all_indices.extend(loop_seg)
             all_indices.extend(range(h.loop_end+1,h.num_layers))
-            num_enc=len(all_indices)//2
+            num_enc=h.loop_split if h.loop_split>=0 else len(all_indices)//2
+            if not 0<=num_enc<=len(all_indices):
+                raise ValueError(f"LOOP_SPLIT={h.loop_split} must be in [0, {len(all_indices)}]")
             self.encoder_indices=all_indices[:num_enc]
             self.decoder_indices=all_indices[num_enc:]
         else:
