@@ -5,10 +5,7 @@ import constriction
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor,nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
-QUANT_OVERRIDES={
-    "blocks.10.mlp.proj.weight":{"bits":7,"clip_sigmas":15.5},
-    "blocks.0.attn.c_v.weight":{"bits":7,"clip_sigmas":10.5},
-}
+QUANT_OVERRIDES={}
 class Hyperparameters:
     data_dir=os.environ.get('DATA_DIR','./data/')
     seed=int(os.environ.get('SEED',1337))
@@ -81,7 +78,7 @@ class Hyperparameters:
     gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.))
     matrix_bits=int(os.environ.get('MATRIX_BITS',6))
     embed_bits=int(os.environ.get('EMBED_BITS',8))
-    matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',12.85))
+    matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',15.5))
     embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1))
     distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ
     rank=int(os.environ.get('RANK','0'))
