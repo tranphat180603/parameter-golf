@@ -18,6 +18,7 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import constriction
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
 
@@ -41,6 +42,7 @@ class Hyperparameters():
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 2048))
     train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 500))
     max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
+    quantize_only = bool(int(os.environ.get('QUANTIZE_ONLY', '0')))
 
     # Validation/Evals
     val_batch_tokens = int(os.environ.get('VAL_BATCH_TOKENS', 2048 * 32 * 8))
@@ -49,7 +51,7 @@ class Hyperparameters():
     sliding_window_enabled = bool(int(os.environ.get('SLIDING_WINDOW_ENABLED', '1')))
 
     # Model architecture
-    vocab_size = int(os.environ.get('VOCAB_SIZE', 8192))
+    vocab_size = int(os.environ.get('VOCAB_SIZE', 10240))
     num_layers = int(os.environ.get('NUM_LAYERS', 11))
     xsa_last_n = int(os.environ.get('XSA_LAST_N', 11))
     model_dim = int(os.environ.get('MODEL_DIM', 512))
@@ -64,7 +66,7 @@ class Hyperparameters():
     rope_dims = int(os.environ.get('ROPE_DIMS', 16))
     rope_train_seq_len = int(os.environ.get('ROPE_TRAIN_SEQ_LEN', 2048))
     ln_scale = bool(int(os.environ.get('LN_SCALE', '1')))
-    qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 4.0))
+    qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 5.25))
 
     # Layer looping
     num_loops = int(os.environ.get('NUM_LOOPS', 2))
@@ -95,6 +97,11 @@ class Hyperparameters():
     muon_wd = float(os.environ.get('MUON_WD', 0.085))
     embed_wd = float(os.environ.get('EMBED_WD', 0.085))
     ema_decay = float(os.environ.get('EMA_DECAY', 0.997))
+    ttt_enabled = bool(int(os.environ.get('TTT_ENABLED', '0')))
+    ttt_lr = float(os.environ.get('TTT_LR', 0.005))
+    ttt_epochs = int(os.environ.get('TTT_EPOCHS', 3))
+    ttt_momentum = float(os.environ.get('TTT_MOMENTUM', 0.9))
+    ttt_chunk_tokens = int(os.environ.get('TTT_CHUNK_TOKENS', 32768))
 
     # Quantization & Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')
@@ -102,7 +109,7 @@ class Hyperparameters():
     gptq_reserve_seconds = float(os.environ.get('GPTQ_RESERVE_SECONDS', 12.0))
     matrix_bits = int(os.environ.get('MATRIX_BITS', 6))
     embed_bits = int(os.environ.get('EMBED_BITS', 8))
-    matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
+    matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 14.2))
     embed_clip_sigmas = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
 
     # Distributed setup
@@ -131,9 +138,15 @@ class Hyperparameters():
 _logger_hparams = None
 
 
+def _ensure_parent_dir(path: str) -> None:
+    Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
+
 def set_logging_hparams(h: Hyperparameters) -> None:
     global _logger_hparams
     _logger_hparams = h
+    if h.logfile is not None:
+        _ensure_parent_dir(h.logfile)
 
 
 def log(msg, console: bool = True) -> None:
@@ -957,9 +970,195 @@ def _decompress(data: bytes, compressor: str) -> bytes:
     return raw
 
 
+_ARTIFACT_MAGIC = b"PGQF"
+_ARTIFACT_VERSION = 1
+_MODE_PASSTHROUGH = 0
+_MODE_ANS_Q = 1
+_MODE_RAW_SCALE = 2
+_DTYPE_TO_CODE = {
+    torch.float16: 1,
+    torch.float32: 2,
+    torch.int8: 3,
+    torch.uint8: 4,
+    torch.int16: 5,
+    torch.int32: 6,
+    torch.int64: 7,
+    torch.uint16: 8,
+}
+_CODE_TO_NUMPY_DTYPE = {
+    1: np.dtype("<f2"),
+    2: np.dtype("<f4"),
+    3: np.dtype("i1"),
+    4: np.dtype("u1"),
+    5: np.dtype("<i2"),
+    6: np.dtype("<i4"),
+    7: np.dtype("<i8"),
+    8: np.dtype("<u2"),
+}
+
+
+def _append_u8(buf: bytearray, value: int) -> None:
+    buf.append(int(value) & 255)
+
+
+def _append_u32(buf: bytearray, value: int) -> None:
+    buf.extend(int(value).to_bytes(4, "little", signed=False))
+
+
+def _read_u8(blob: bytes, offset: int) -> tuple[int, int]:
+    if offset >= len(blob):
+        raise ValueError("Unexpected end of artifact while reading u8")
+    return blob[offset], offset + 1
+
+
+def _read_u32(blob: bytes, offset: int) -> tuple[int, int]:
+    end = offset + 4
+    if end > len(blob):
+        raise ValueError("Unexpected end of artifact while reading u32")
+    return int.from_bytes(blob[offset:end], "little", signed=False), end
+
+
+def _read_bytes(blob: bytes, offset: int, size: int) -> tuple[bytes, int]:
+    end = offset + size
+    if end > len(blob):
+        raise ValueError(f"Unexpected end of artifact while reading {size} bytes")
+    return blob[offset:end], end
+
+
+def _tensor_to_bytes(t: Tensor) -> bytes:
+    if t.dtype not in _DTYPE_TO_CODE:
+        raise TypeError(f"Unsupported tensor dtype for custom artifact: {t.dtype}")
+    return t.detach().cpu().contiguous().numpy().tobytes()
+
+
+def _tensor_from_bytes(raw: bytes, dtype_code: int, shape: tuple[int, ...]) -> Tensor:
+    np_dtype = _CODE_TO_NUMPY_DTYPE.get(dtype_code)
+    if np_dtype is None:
+        raise ValueError(f"Unsupported dtype code in custom artifact: {dtype_code}")
+    flat = np.frombuffer(raw, dtype=np_dtype)
+    expected_numel = int(np.prod(shape, dtype=np.int64)) if len(shape) > 0 else 1
+    if flat.size != expected_numel:
+        raise ValueError(f"Artifact tensor size mismatch: expected {expected_numel}, got {flat.size}")
+    return torch.from_numpy(flat.copy().reshape(shape))
+
+
+def _bits_from_meta(info: object) -> int:
+    match = re.search(r"int(\d+)", str(info))
+    if match is None:
+        raise ValueError(f"Could not parse quantization bits from meta: {info!r}")
+    return int(match.group(1))
+
+
+def _entry_count_for_artifact(template_sd: dict[str, Tensor], meta: dict[str, object]) -> int:
+    return sum(1 if "passthrough" in str(meta[name]) else 2 for name in template_sd)
+
+
+def _encode_artifact(template_sd: dict[str, Tensor], quant_result: dict[str, Tensor], quant_meta: dict[str, object]) -> bytes:
+    buf = bytearray()
+    buf.extend(_ARTIFACT_MAGIC)
+    _append_u8(buf, _ARTIFACT_VERSION)
+    _append_u32(buf, _entry_count_for_artifact(template_sd, quant_meta))
+    for name, orig in template_sd.items():
+        info = str(quant_meta[name])
+        if "passthrough" in info:
+            t = quant_result[name].detach().cpu().contiguous()
+            raw = _tensor_to_bytes(t)
+            _append_u8(buf, _MODE_PASSTHROUGH)
+            _append_u8(buf, _DTYPE_TO_CODE[t.dtype])
+            _append_u32(buf, len(raw))
+            buf.extend(raw)
+            continue
+        bits = _bits_from_meta(info)
+        clip_range = 2 ** (bits - 1) - 1
+        q = quant_result[name + ".q"].detach().cpu().contiguous()
+        if q.shape != orig.shape:
+            raise ValueError(f"Quantized tensor shape mismatch for {name}: {tuple(q.shape)} vs {tuple(orig.shape)}")
+        symbols = (q.to(torch.int32).reshape(-1).numpy() + clip_range).astype(np.int32, copy=False)
+        alphabet_size = 2 * clip_range + 1
+        counts = np.bincount(symbols, minlength=alphabet_size).astype(np.uint32, copy=False)
+        model = constriction.stream.model.Categorical(counts.astype(np.float64), perfect=True)
+        coder = constriction.stream.stack.AnsCoder()
+        coder.encode_reverse(symbols, model)
+        words = np.asarray(coder.get_compressed(), dtype=np.uint32)
+        _append_u8(buf, _MODE_ANS_Q)
+        _append_u8(buf, _DTYPE_TO_CODE[q.dtype])
+        _append_u32(buf, symbols.size)
+        _append_u32(buf, alphabet_size)
+        _append_u32(buf, words.size)
+        buf.extend(counts.astype("<u4", copy=False).tobytes())
+        buf.extend(words.astype("<u4", copy=False).tobytes())
+        s = quant_result[name + ".scale"].detach().cpu().contiguous()
+        raw = _tensor_to_bytes(s)
+        _append_u8(buf, _MODE_RAW_SCALE)
+        _append_u8(buf, _DTYPE_TO_CODE[s.dtype])
+        _append_u32(buf, len(raw))
+        buf.extend(raw)
+    return bytes(buf)
+
+
+def _decode_artifact(blob: bytes, template_sd: dict[str, Tensor]) -> tuple[dict[str, Tensor], dict[str, object]]:
+    if len(blob) < 9 or blob[:4] != _ARTIFACT_MAGIC:
+        raise ValueError("Unknown custom artifact header")
+    version = blob[4]
+    if version != _ARTIFACT_VERSION:
+        raise ValueError(f"Unsupported custom artifact version: {version}")
+    offset = 5
+    entry_count, offset = _read_u32(blob, offset)
+    seen_entries = 0
+    result: dict[str, Tensor] = {}
+    meta: dict[str, object] = {}
+    for name, orig in template_sd.items():
+        mode, offset = _read_u8(blob, offset)
+        dtype_code, offset = _read_u8(blob, offset)
+        seen_entries += 1
+        if mode == _MODE_PASSTHROUGH:
+            payload_len, offset = _read_u32(blob, offset)
+            raw, offset = _read_bytes(blob, offset, payload_len)
+            result[name] = _tensor_from_bytes(raw, dtype_code, tuple(orig.shape))
+            meta[name] = "passthrough (artifact)"
+            continue
+        if mode != _MODE_ANS_Q:
+            raise ValueError(f"Unexpected mode {mode} for quantized tensor {name}")
+        symbol_count, offset = _read_u32(blob, offset)
+        alphabet_size, offset = _read_u32(blob, offset)
+        word_count, offset = _read_u32(blob, offset)
+        counts_raw, offset = _read_bytes(blob, offset, alphabet_size * 4)
+        words_raw, offset = _read_bytes(blob, offset, word_count * 4)
+        expected_symbols = int(orig.numel())
+        if symbol_count != expected_symbols:
+            raise ValueError(f"Symbol count mismatch for {name}: expected {expected_symbols}, got {symbol_count}")
+        counts = np.frombuffer(counts_raw, dtype="<u4").astype(np.uint32, copy=False)
+        words = np.frombuffer(words_raw, dtype="<u4").astype(np.uint32, copy=False)
+        clip_range = (alphabet_size - 1) // 2
+        bits = int(round(math.log2(alphabet_size + 1)))
+        model = constriction.stream.model.Categorical(counts.astype(np.float64), perfect=True)
+        coder = constriction.stream.stack.AnsCoder(words)
+        symbols = np.asarray(coder.decode(model, symbol_count), dtype=np.int32)
+        q_values = (symbols - clip_range).reshape(tuple(orig.shape))
+        q_dtype = _CODE_TO_NUMPY_DTYPE.get(dtype_code)
+        if q_dtype is None:
+            raise ValueError(f"Unsupported q dtype code in artifact: {dtype_code}")
+        result[name + ".q"] = torch.from_numpy(q_values.astype(q_dtype, copy=False))
+        meta[name] = f"gptq (int{bits})"
+        scale_mode, offset = _read_u8(blob, offset)
+        scale_dtype_code, offset = _read_u8(blob, offset)
+        seen_entries += 1
+        if scale_mode != _MODE_RAW_SCALE:
+            raise ValueError(f"Unexpected mode {scale_mode} for scale tensor {name}")
+        payload_len, offset = _read_u32(blob, offset)
+        raw, offset = _read_bytes(blob, offset, payload_len)
+        result[name + ".scale"] = _tensor_from_bytes(raw, scale_dtype_code, (orig.shape[0],))
+    if seen_entries != entry_count:
+        raise ValueError(f"Artifact entry count mismatch: expected {entry_count}, decoded {seen_entries}")
+    if offset != len(blob):
+        raise ValueError(f"Artifact has {len(blob) - offset} trailing bytes")
+    return result, meta
+
+
 def serialize(h: Hyperparameters, base_model: torch.nn.Module, code: str) -> tuple[int, int]:
     code_bytes = len(code.encode("utf-8"))
     if h.is_main_process:
+        _ensure_parent_dir(h.model_path)
         torch.save(base_model.state_dict(), h.model_path)
         model_bytes = os.path.getsize(h.model_path)
         log(f"Serialized model: {model_bytes} bytes")
@@ -976,18 +1175,15 @@ def serialize(h: Hyperparameters, base_model: torch.nn.Module, code: str) -> tup
     )
     log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter() - t0:.1f}s")
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
-
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = _compress(quant_raw, h.compressor)
+    quant_blob = _encode_artifact(sd_cpu, quant_result, quant_meta)
     quant_file_bytes = len(quant_blob)
     bytes_total = quant_file_bytes + code_bytes
     if h.is_main_process:
+        _ensure_parent_dir(h.quantized_model_path)
         with open(h.quantized_model_path, "wb") as f:
             f.write(quant_blob)
-        log(f"Serialized model quantized+{h.compressor}: {quant_file_bytes} bytes")
-        log(f"Total submission size quantized+{h.compressor}: {bytes_total} bytes")
+        log(f"Serialized model quantized+ans: {quant_file_bytes} bytes")
+        log(f"Total submission size quantized+ans: {bytes_total} bytes")
     return bytes_total, quant_file_bytes
 
 
@@ -998,11 +1194,15 @@ def deserialize(h: Hyperparameters, device: torch.device) -> GPT:
 
     with open(h.quantized_model_path, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(
-        io.BytesIO(_decompress(quant_blob_disk, h.compressor)),
-        map_location="cpu",
-    )
-    deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], sd_cpu)
+    if quant_blob_disk[:4] == _ARTIFACT_MAGIC:
+        quant_result, quant_meta = _decode_artifact(quant_blob_disk, sd_cpu)
+    else:
+        quant_state = torch.load(
+            io.BytesIO(_decompress(quant_blob_disk, h.compressor)),
+            map_location="cpu",
+        )
+        quant_result, quant_meta = quant_state["w"], quant_state["m"]
+    deq_state = dequantize_mixed(quant_result, quant_meta, sd_cpu)
     eval_model.load_state_dict(deq_state, strict=True)
 
     return eval_model
@@ -1141,6 +1341,132 @@ def eval_val_sliding(
         dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
 
     base_model.train()
+    return _loss_bpb(loss_sum, token_count, byte_count)
+
+
+def eval_val_ttt(
+    h: Hyperparameters,
+    device: torch.device,
+    val_data: ValidationData,
+    base_model: GPT,
+    batch_seqs: int = 32,
+) -> tuple[float, float]:
+    rank = h.rank
+    world_size = h.world_size
+    seq_len = h.eval_seq_len
+    stride = h.eval_stride
+    total_tokens = val_data.val_tokens.numel() - 1
+    ttt_chunk = h.ttt_chunk_tokens
+    context_size = seq_len - stride
+
+    window_starts = [ws for ws in range(0, total_tokens, stride) if ws + context_size < total_tokens]
+    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
+    chunk_windows = [[] for _ in range(num_chunks)]
+    for ws in window_starts:
+        wlen = min(ws + seq_len, total_tokens) - ws
+        s = 0 if ws == 0 else context_size
+        scored_start = ws + s
+        ci = min(scored_start // ttt_chunk, num_chunks - 1)
+        chunk_windows[ci].append(ws)
+
+    log(f"ttt:start chunks={num_chunks} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs}")
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    ttt_params = [p for p in base_model.parameters()]
+    for p in ttt_params:
+        p.requires_grad_(True)
+    optimizer = torch.optim.SGD(ttt_params, lr=h.ttt_lr, momentum=h.ttt_momentum)
+
+    for ci in range(num_chunks):
+        windows = chunk_windows[ci]
+        if not windows:
+            continue
+        chunk_start = ci * ttt_chunk
+        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
+        my_s = len(windows) * rank // world_size
+        my_e = len(windows) * (rank + 1) // world_size
+        my_windows = windows[my_s:my_e]
+
+        base_model.eval()
+        with torch.no_grad():
+            for bi in range(0, len(my_windows), batch_seqs):
+                batch_ws = my_windows[bi:bi + batch_seqs]
+                bsz = len(batch_ws)
+                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                wlens: list[int] = []
+                for i, ws in enumerate(batch_ws):
+                    we = min(ws + seq_len, total_tokens)
+                    wlen = we - ws
+                    wlens.append(wlen)
+                    chunk_tok = val_data.val_tokens[ws:we + 1].to(dtype=torch.int64, device=device)
+                    x_batch[i, :wlen] = chunk_tok[:-1]
+                    y_batch[i, :wlen] = chunk_tok[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = compiled_logits(x_batch)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, seq_len)
+                for i, ws in enumerate(batch_ws):
+                    wlen = wlens[i]
+                    s = 0 if ws == 0 else context_size
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(wlen - s)
+                    tgt = y_batch[i, s:wlen]
+                    prev = x_batch[i, s:wlen]
+                    tb = val_data.base_bytes_lut[tgt].to(torch.float64)
+                    tb += (val_data.has_leading_space_lut[tgt] &
+                           ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
+
+        is_last_chunk = ci == num_chunks - 1
+        if not is_last_chunk and h.ttt_epochs > 0:
+            base_model.train()
+            chunk_seqs = (chunk_end - chunk_start) // seq_len
+            if chunk_seqs > 0:
+                cos_lr = h.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in optimizer.param_groups:
+                    pg["lr"] = cos_lr
+                my_seq_s = chunk_seqs * rank // world_size
+                my_seq_e = chunk_seqs * (rank + 1) // world_size
+                my_chunk_seqs = my_seq_e - my_seq_s
+                for _ep in range(h.ttt_epochs):
+                    for bs in range(0, my_chunk_seqs, batch_seqs):
+                        be = min(bs + batch_seqs, my_chunk_seqs)
+                        actual_bs = my_seq_s + bs
+                        start_tok = chunk_start + actual_bs * seq_len
+                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
+                        if end_tok > val_data.val_tokens.numel():
+                            continue
+                        local = val_data.val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
+                        x = local[:-1].reshape(-1, seq_len)
+                        y = local[1:].reshape(-1, seq_len)
+                        optimizer.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            loss = base_model(x, y)
+                        loss.backward()
+                        if world_size > 1:
+                            for p in ttt_params:
+                                if p.grad is not None:
+                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
+                        optimizer.step()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+    base_model.eval()
     return _loss_bpb(loss_sum, token_count, byte_count)
 
 
@@ -1329,6 +1655,17 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     torch.manual_seed(h.seed)
     torch.cuda.manual_seed_all(h.seed)
 
+    if h.quantize_only:
+        if not Path(h.model_path).exists():
+            raise FileNotFoundError(f"MODEL_PATH not found for quantize-only mode: {h.model_path}")
+        log(f"quantize_only: loading checkpoint from {h.model_path}")
+        base_model = GPT(h).to(device).bfloat16()
+        restore_fp32_params(base_model)
+        sd = torch.load(h.model_path, map_location="cpu")
+        base_model.load_state_dict(sd, strict=True)
+        serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
+        return
+
     val_data = ValidationData(h, device)
     log(f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}")
     log(f"val_tokens: {val_data.val_tokens.numel() - 1}")
@@ -1348,6 +1685,14 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
         timed_eval("quantized_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
+    if h.ttt_enabled and h.sliding_window_enabled:
+        del eval_model, compiled_model
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
+        ttt_model = deserialize(h, device)
+        if h.num_loops > 0:
+            ttt_model.looping_active = True
+        timed_eval("quantized_ttt", eval_val_ttt, h, device, val_data, ttt_model)
 
 
 def main():
