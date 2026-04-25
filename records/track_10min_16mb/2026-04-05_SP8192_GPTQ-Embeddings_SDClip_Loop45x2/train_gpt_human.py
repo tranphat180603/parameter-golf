@@ -83,7 +83,7 @@ class Hyperparameters():
     matrix_lr = float(os.environ.get('MATRIX_LR', 0.02))
     scalar_lr = float(os.environ.get('SCALAR_LR', 0.02))
     muon_momentum = float(os.environ.get('MUON_MOMENTUM', 0.99))
-    muon_backend_steps = int(os.environ.get('MUON_BACKEND_STEPS', 5))
+    muon_backend_steps = int(os.environ.get('MUON_BACKEND_STEPS', 4))
     muon_momentum_warmup_start = float(os.environ.get('MUON_MOMENTUM_WARMUP_START', 0.92))
     muon_momentum_warmup_steps = int(os.environ.get('MUON_MOMENTUM_WARMUP_STEPS', 1500))
     muon_row_normalize = bool(int(os.environ.get('MUON_ROW_NORMALIZE', '1')))
@@ -582,19 +582,73 @@ def classify_param(name: str) -> str:
 # Optimization
 # ----------------------------------------
 
+# Per-iteration optimal minimax coefficients (You Jiacheng, ICLR 2026, arXiv:2505.16932)
+_POLAR_5 = [(4.0848, -6.8946, 2.927), (3.9505, -6.3029, 2.6377),
+            (3.7418, -5.5913, 2.3037), (2.8769, -3.1427, 1.2046), (2.8366, -3.0525, 1.2012)]
+
 @torch.compile
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    a, b, c = (3.4445, -4.7750, 2.0315)
+def _ns_standard(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
+    """Newton-Schulz with Turbo-Muon AOL + Polar Express. For square-ish matrices (aspect < 1.5)."""
+    coeffs = _POLAR_5[-steps:]
     X = G.bfloat16()
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
-    for _ in range(steps):
+    for i in range(steps):
+        a, b, c = coeffs[i]
         A = X @ X.T
+        if i == 0:
+            s = torch.rsqrt(A.abs().sum(dim=-1).clamp(min=eps))
+            X = X * s.unsqueeze(-1)
+            A = A * s.unsqueeze(-1) * s.unsqueeze(-2)
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
+
+@torch.compile
+def _ns_gram(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
+    """Gram-Newton-Schulz. For rectangular matrices (aspect >= 1.5).
+    Iterates on small R=X@X.T (n x n) instead of full X. Saves ~22% FLOPs on MLP weights."""
+    coeffs = _POLAR_5[-steps:]
+    X = G.bfloat16()
+    X /= X.norm() + eps
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    n = X.size(0)
+    I_n = torch.eye(n, device=X.device, dtype=X.dtype)
+    R = X @ X.T
+    Q = I_n.clone()
+    for i in range(steps):
+        a, b, c = coeffs[i]
+        if i == 2:
+            X = Q @ X
+            R = X @ X.T
+            Q = I_n.clone()
+        if i == 0:
+            s = torch.rsqrt(R.abs().sum(dim=-1).clamp(min=eps))
+            X = X * s.unsqueeze(-1)
+            R = R * s.unsqueeze(-1) * s.unsqueeze(-2)
+        Z = b * R + c * (R @ R)
+        if i == 0 or i == 2:
+            Q = a * I_n + Z
+        else:
+            Q = a * Q + Z @ Q
+        is_last = i == steps - 1
+        next_restart = i + 1 == 2
+        if not is_last and not next_restart:
+            RZ = Z @ R + a * R
+            R = Z @ RZ + a * RZ
+    X = Q @ X
+    return X.T if transposed else X
+
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
+    """Dispatch: Gram-NS for rectangular matrices, standard NS for square-ish."""
+    n, m = G.size(0), G.size(1)
+    if max(n, m) / max(min(n, m), 1) >= 1.5:
+        return _ns_gram(G, steps, eps)
+    return _ns_standard(G, steps, eps)
 
 
 class Muon(torch.optim.Optimizer):
