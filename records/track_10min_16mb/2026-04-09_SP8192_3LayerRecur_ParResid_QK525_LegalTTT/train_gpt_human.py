@@ -5,7 +5,6 @@ import constriction
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor,nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
-QUANT_OVERRIDES={}
 class Hyperparameters:
     data_dir=os.environ.get('DATA_DIR','./data/')
     seed=int(os.environ.get('SEED',1337))
@@ -80,7 +79,7 @@ class Hyperparameters:
     gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.))
     matrix_bits=int(os.environ.get('MATRIX_BITS',6))
     embed_bits=int(os.environ.get('EMBED_BITS',8))
-    matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',15.5))
+    matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',12.85))
     embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1))
     distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ
     rank=int(os.environ.get('RANK','0'))
@@ -92,43 +91,12 @@ class Hyperparameters:
     train_files=os.path.join(datasets_dir,'fineweb_train_*.bin')
     val_files=os.path.join(datasets_dir,'fineweb_val_*.bin')
     tokenizer_path=os.path.join(data_dir,'tokenizers',f"fineweb_{vocab_size}_bpe.model")
-    quant_override_path=os.environ.get('QUANT_OVERRIDE_PATH')
     logfile=os.environ.get('LOGFILE',f"logs/{run_id}.txt")
     model_path=os.environ.get('MODEL_PATH','final_model.pt')
     quantized_model_path=os.environ.get('QUANTIZED_MODEL_PATH','final_model.int6.ptz')
 _logger_hparams=None
-_quant_override_cache={}
 def _ensure_parent_dir(path):
     Path(path).expanduser().resolve().parent.mkdir(parents=True,exist_ok=True)
-def _load_quant_overrides(path):
-    if path in _quant_override_cache:
-        return _quant_override_cache[path]
-    data=json.loads(Path(path).expanduser().read_text(encoding='utf-8'))
-    if not isinstance(data,dict):
-        raise TypeError(f"Override file must contain a JSON object: {path}")
-    out={}
-    for(name,opts)in data.items():
-        if not isinstance(name,str)or not isinstance(opts,dict):
-            raise TypeError(f"Override entries must map string names to option objects: {path}")
-        parsed={}
-        if 'bits'in opts:
-            parsed['bits']=int(opts['bits'])
-        if 'clip_sigmas'in opts:
-            parsed['clip_sigmas']=float(opts['clip_sigmas'])
-        out[name]=parsed
-    _quant_override_cache[path]=out
-    return out
-def _quant_overrides_for(h):
-    if h.quant_override_path:
-        return _load_quant_overrides(h.quant_override_path)
-    return QUANT_OVERRIDES
-def _format_quant_override(opts):
-    parts=[]
-    if 'bits' in opts:
-        parts.append(f"bits={opts['bits']}")
-    if 'clip_sigmas' in opts:
-        parts.append(f"clip_sigmas={opts['clip_sigmas']}")
-    return ', '.join(parts) if parts else '(empty)'
 def set_logging_hparams(h):
     global _logger_hparams
     _logger_hparams=h
@@ -662,19 +630,14 @@ def gptq_quantize_weight(w,H,clip_sigmas=3.,clip_range=63,block_size=128):
 def gptq_mixed_quantize(state_dict,hessians,h):
     result={}
     meta={}
-    used_overrides={}
-    override_map=_quant_overrides_for(h)
     for(name,tensor)in state_dict.items():
         t=tensor.detach().cpu().contiguous()
         if not t.is_floating_point()or t.numel()<=65536:
             result[name]=t.to(torch.float16)if t.is_floating_point()else t
             meta[name]='passthrough (float16)'
             continue
-        override=override_map.get(name,{})
-        cs=override.get('clip_sigmas',h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas)
-        bits=override.get('bits',h.embed_bits if'tok_emb'in name else h.matrix_bits)
-        if override:
-            used_overrides[name]=dict(override)
+        cs=h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas
+        bits=h.embed_bits if'tok_emb'in name else h.matrix_bits
         q,s=gptq_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=2**(bits-1)-1)
         result[name+'.q']=q
         result[name+'.scale']=s
@@ -686,11 +649,6 @@ def gptq_mixed_quantize(state_dict,hessians,h):
     log('Quantized weights:')
     for cat in sorted(categories):
         log(f"  {cat}: {', '.join(sorted(categories[cat]))}")
-    if used_overrides:
-        log('Quantization overrides:')
-        for name in sorted(used_overrides):
-            opts=', '.join(f"{k}={v}" for(k,v)in sorted(used_overrides[name].items()))
-            log(f"  {name}: {opts}")
     return result,meta
 def dequantize_mixed(result,meta,template_sd):
     out={}
@@ -1339,13 +1297,6 @@ def main():
         for(k,v)in sorted(vars(type(h)).items()):
             if not k.startswith('_'):
                 log(f"  {k}: {v}",console=True)
-        active_quant_overrides=_quant_overrides_for(h)
-        log('Active quantization overrides:',console=True)
-        if active_quant_overrides:
-            for(name,opts)in sorted(active_quant_overrides.items()):
-                log(f"  {name}: {_format_quant_override(opts)}",console=True)
-        else:
-            log('  (none)',console=True)
         log('='*100,console=False)
         log(f"Running Python {sys.version}",console=False)
         log(f"Running PyTorch {torch.__version__}",console=False)
